@@ -557,6 +557,13 @@ class ListsResult {
   }
 }
 
+class PeerInfo {
+  final String id, name, at;
+  final bool partial; // نسخة قديمة (من غير صورة كاملة)
+  const PeerInfo(this.id, this.name, this.at, this.partial);
+  String get label => name.isEmpty ? 'التليفون التاني' : name;
+}
+
 class CopyResult {
   final bool ok;
   final String message;
@@ -697,6 +704,8 @@ class MoneyData {
   List<String> billNames; // أسماء الفواتير اللي اتكتبت قبل كده
   String peerName; // اسم التليفون التاني (من آخر ملف جه منه)
   String syncFolder; // فولدر الاستلام اللي اتحدد مرة واحدة ('' = لسه)
+  /// آخر صورة كاملة من كل تليفون تاني (عشان تتفرج عليه): تليفون ← {name, at, data}
+  Map<String, Map<String, dynamic>> peers;
 
   MoneyData({
     required this.phoneId,
@@ -716,7 +725,9 @@ class MoneyData {
     List<String>? billNames,
     this.peerName = '',
     this.syncFolder = '',
-  })  : sources = sources ?? [],
+    Map<String, Map<String, dynamic>>? peers,
+  })  : peers = peers ?? {},
+        sources = sources ?? [],
         reasons = reasons ?? [],
         billNames = billNames ?? List<String>.from(kDefaultBillNames),
         places = places ?? [],
@@ -780,6 +791,7 @@ class MoneyData {
         'billNames': billNames,
         'peerName': peerName,
         'syncFolder': syncFolder,
+        'peers': peers,
       };
 
   factory MoneyData.fromJson(Map<String, dynamic> j) {
@@ -840,7 +852,107 @@ class MoneyData {
       billNames: j['billNames'] is List ? sl('billNames') : null,
       peerName: '${j['peerName'] ?? ''}',
       syncFolder: '${j['syncFolder'] ?? ''}',
+      peers: _peersFrom(j['peers']),
     );
+  }
+
+  static Map<String, Map<String, dynamic>> _peersFrom(dynamic raw) {
+    final out = <String, Map<String, dynamic>>{};
+    if (raw is Map) {
+      raw.forEach((k, v) {
+        if (v is Map && v['data'] is Map) out['$k'] = Map<String, dynamic>.from(v);
+      });
+    }
+    return out;
+  }
+
+  // ---------- الفُرجة على التليفون التاني ----------
+  /// صورة كاملة من التليفون ده (أماكن + أرصدة البداية + كل العمليات + السلف + الفواتير + القوايم)
+  /// من غير اللي جاله من تليفونات تانية ومن غير إعدادات الاستلام.
+  Map<String, dynamic> snapshotJson() {
+    final j = toJson();
+    for (final k in ['imported', 'copySeen', 'syncFolder', 'peers', 'lastPlaceId', 'lastInPlaceId']) {
+      j.remove(k);
+    }
+    j['phoneName'] = badgeName;
+    j['balances'] = {for (final p in places) p.id: balanceOf(p.id)};
+    return j;
+  }
+
+  /// التليفونات التانية اللي أقدر أتفرج عليها (من الصور الكاملة أو من الشهور القديمة)
+  List<PeerInfo> knownPeers() {
+    final m = <String, PeerInfo>{};
+    peers.forEach((pid, v) {
+      m[pid] = PeerInfo(pid, cleanLabel('${v['name'] ?? ''}'), '${v['at'] ?? ''}', false);
+    });
+    for (final im in imported.values) {
+      if (m.containsKey(im.phoneId)) continue;
+      m[im.phoneId] = PeerInfo(im.phoneId, cleanLabel(im.phoneName), lastCopyAt(im.phoneId), true);
+    }
+    final l = m.values.toList()..sort((a, b) => b.at.compareTo(a.at));
+    return l;
+  }
+
+  /// بيانات التليفون التاني زي ما هي عنده (للفرجة بس — مش بتتحفظ ولا بتتعدل)
+  MoneyData? peerView(String pid) {
+    final v = peers[pid];
+    if (v != null && v['data'] is Map) {
+      final dj = Map<String, dynamic>.from(v['data'] as Map);
+      dj.remove('imported');
+      dj.remove('peers');
+      final pd = MoneyData.fromJson(dj);
+      pd.phoneId = pid;
+      if (cleanLabel(pd.phoneName).isEmpty) pd.phoneName = '${v['name'] ?? ''}';
+      pd.peerName = badgeName;
+      return pd;
+    }
+    // نسخة قديمة (v3 أو ملف شهر): من الشهور اللي وصلت بس
+    final ms = imported.values.where((m) => m.phoneId == pid).toList()..sort((a, b) => a.month.compareTo(b.month));
+    if (ms.isEmpty) return null;
+    final placeNames = <String, String>{}, personNames = <String, String>{}, bNames = <String, String>{};
+    final txs = <Txn>[];
+    final seen = <String>{};
+    for (final m in ms) {
+      placeNames.addAll(m.placeNames);
+      personNames.addAll(m.personNames);
+      bNames.addAll(m.billNames);
+      for (final t in m.txns) {
+        if (seen.add(t.id)) txs.add(t.copy());
+      }
+    }
+    for (final t in txs) {
+      if (t.placeId.isNotEmpty) placeNames.putIfAbsent(t.placeId, () => 'مكان');
+      if (t.toPlaceId.isNotEmpty) placeNames.putIfAbsent(t.toPlaceId, () => 'مكان');
+    }
+    final pd = MoneyData(
+      phoneId: pid,
+      phoneName: ms.last.phoneName,
+      places: [
+        for (final e in placeNames.entries)
+          Place(id: e.key, name: e.value, kind: _guessKind(e.value)),
+      ],
+      people: [for (final e in personNames.entries) Person(id: e.key, name: e.value)],
+      bills: [for (final e in bNames.entries) Bill(id: e.key, name: e.value)],
+      txns: txs,
+      billNames: [],
+      peerName: badgeName,
+    );
+    // رصيد البداية: من رصيد آخر الشهر اللي في آخر ملف (عشان الأرصدة تطلع صح لحد الشهر ده)
+    final last = ms.last;
+    final lastDay = isoDate(monthLast(last.month));
+    for (final p in pd.places) {
+      final eb = last.endBalances[p.name];
+      if (eb == null) continue;
+      p.opening = eb - pd.balanceOf(p.id, upTo: lastDay);
+    }
+    return pd;
+  }
+
+  static String _guessKind(String name) {
+    if (name.contains('كاش')) return kPlaceCash;
+    if (name.contains('بنك')) return kPlaceBank;
+    if (name.contains('محفظ')) return kPlaceWallet;
+    return kPlaceOther;
   }
 
   // ---------- الاختيارات اللي بتتكتب مرة وتفضل ----------
@@ -1267,6 +1379,8 @@ class MoneyData {
       'scope': month ?? 'all',
       'months': [for (final mk in months) exportMonth(mk)],
       'lists': exportLists(),
+      // v4: صورة كاملة عشان التليفون التاني يقدر يتفرج على أرصدتك وعملياتك
+      'snapshot': snapshotJson(),
     };
   }
 
@@ -1316,6 +1430,12 @@ class MoneyData {
     if (j['lists'] is Map) {
       final lr = mergeListsJson(j['lists'], addPlaces: false);
       if (lr.ok) listsAdded = lr.total;
+    }
+    if (j['snapshot'] is Map && '${(j['snapshot'] as Map)['phoneId']}' == pid) {
+      final old = '${peers[pid]?['at'] ?? ''}';
+      if (old.isEmpty || at.compareTo(old) >= 0) {
+        peers[pid] = {'name': name, 'at': at, 'data': Map<String, dynamic>.from(j['snapshot'] as Map)};
+      }
     }
     copySeen[pid] = at;
     learnPeer(name);
@@ -2502,12 +2622,13 @@ class SectionTitle extends StatelessWidget {
 class PhoneBadge extends StatelessWidget {
   final MoneyData data;
   final VoidCallback onTap;
-  const PhoneBadge({super.key, required this.data, required this.onTap});
+  final bool viewing;
+  const PhoneBadge({super.key, required this.data, required this.onTap, this.viewing = false});
   @override
   Widget build(BuildContext context) {
-    const color = C.gold;
+    final color = viewing ? C.blue : C.gold;
     return Tooltip(
-      message: 'اسم التليفون ده — دوس عشان تغيّره',
+      message: 'دوس عشان تبدّل بين التليفونين',
       child: InkWell(
         borderRadius: BorderRadius.circular(20),
         onTap: onTap,
@@ -2519,19 +2640,82 @@ class PhoneBadge extends StatelessWidget {
               borderRadius: BorderRadius.circular(20),
               border: Border.all(color: color.withValues(alpha: 0.5))),
           child: Row(mainAxisSize: MainAxisSize.min, children: [
-            const Icon(Icons.phone_android_rounded, size: 14, color: color),
+            Icon(viewing ? Icons.visibility_rounded : Icons.phone_android_rounded, size: 14, color: color),
             const SizedBox(width: 4),
             Flexible(
               child: Text(data.badgeName,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontSize: 11.5, color: color, fontWeight: FontWeight.w700)),
+                  style: TextStyle(fontSize: 11.5, color: color, fontWeight: FontWeight.w700)),
             ),
+            const SizedBox(width: 3),
+            Icon(Icons.swap_horiz_rounded, size: 15, color: color),
           ]),
         ),
       ),
     );
   }
+}
+
+/// شريط فوق في وضع الفرجة على التليفون التاني
+class ViewBanner extends StatelessWidget {
+  final String name, at;
+  final bool partial;
+  final VoidCallback onSync, onBack;
+  const ViewBanner(
+      {super.key, required this.name, required this.at, required this.partial, required this.onSync, required this.onBack});
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(12, 4, 12, 6),
+      padding: const EdgeInsets.fromLTRB(12, 8, 8, 8),
+      decoration: BoxDecoration(
+        color: C.blue.withValues(alpha: 0.16),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: C.blue, width: 1.3),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          const Icon(Icons.visibility_rounded, color: C.blue, size: 20),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text('بتتفرج على $name', maxLines: 1, overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w900, color: C.blue)),
+          ),
+        ]),
+        Text('آخر نسخة ${fmtStamp(at)} • فرجة بس، مفيش تعديل', style: const TextStyle(color: C.muted, fontSize: 12)),
+        if (partial)
+          Text('نسخة قديمة — خلي $name يحدّث التطبيق ويبعت نسخة عشان الأرصدة تبان كاملة',
+              style: const TextStyle(color: C.gold, fontSize: 11.5)),
+        const SizedBox(height: 4),
+        Wrap(spacing: 8, runSpacing: 4, children: [
+          OutlinedButton.icon(
+            style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact),
+            onPressed: onSync,
+            icon: const Icon(Icons.sync_rounded, size: 18),
+            label: const Text('تحديث'),
+          ),
+          FilledButton.icon(
+            style: FilledButton.styleFrom(visualDensity: VisualDensity.compact),
+            onPressed: onBack,
+            icon: const Icon(Icons.phone_android_rounded, size: 18),
+            label: const Text('رجوع لتليفوني'),
+          ),
+        ]),
+      ]),
+    );
+  }
+}
+
+/// «تليفون مدام» ← «تليفون مدام» ، «مدام» ← «تليفون مدام»
+String phoneWord(String name) => name.startsWith('تليفون') || name.startsWith('التليفون') ? name : 'تليفون $name';
+
+/// وقت نسخة: «27/11 00:38»
+String fmtStamp(String at) {
+  final w = DateTime.tryParse(at)?.toLocal();
+  if (w == null) return '—';
+  return '${arDateShort(isoDate(w))} ${two(w.hour)}:${two(w.minute)}';
 }
 
 class Pill extends StatelessWidget {
@@ -3675,7 +3859,64 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   int tab = 0;
   String month = monthKeyOf(DateTime.now());
   Timer? _backupTimer;
-  MoneyData get d => widget.data;
+  /// بيانات التليفون ده (اللي بتتحفظ)
+  MoneyData get own => widget.data;
+  /// اللي ظاهر على الشاشة: تليفوني، أو التليفون التاني لو بتتفرج عليه
+  MoneyData get d => _view ?? widget.data;
+  MoneyData? _view;
+  String _viewPid = '';
+  bool get viewOnly => _view != null;
+  String get viewName => d.badgeName;
+  PeerInfo? get viewInfo {
+    if (!viewOnly) return null;
+    for (final p in own.knownPeers()) {
+      if (p.id == _viewPid) return p;
+    }
+    return null;
+  }
+
+  /// في وضع الفرجة: أي تعديل ممنوع
+  bool blockedInView() {
+    if (!viewOnly) return false;
+    toast(context, 'ده ${phoneWord(viewName)} — التعديل من عليه هو', bad: true);
+    return true;
+  }
+
+  void viewPeer(String pid) {
+    final v = own.peerView(pid);
+    if (v == null) {
+      toast(context, 'مفيش نسخة من التليفون ده — دوس تحديث', bad: true);
+      return;
+    }
+    setState(() {
+      _view = v;
+      _viewPid = pid;
+    });
+  }
+
+  void exitView() {
+    if (!viewOnly) return;
+    setState(() {
+      _view = null;
+      _viewPid = '';
+    });
+  }
+
+  /// بعد «تحديث»: لو بتتفرج، اعرض آخر نسخة
+  void _refreshView() {
+    if (!viewOnly) return;
+    final v = own.peerView(_viewPid);
+    setState(() => _view = v);
+  }
+
+  @override
+  void didUpdateWidget(covariant HomeShell old) {
+    super.didUpdateWidget(old);
+    if (!identical(old.data, widget.data)) {
+      _view = null;
+      _viewPid = '';
+    }
+  }
 
   @override
   void initState() {
@@ -3695,11 +3936,12 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState s) {
     if (s == AppLifecycleState.paused) {
       _backupTimer?.cancel();
-      writeAutoBackup(d);
+      writeAutoBackup(own);
     }
   }
 
   Future<void> _checkStorage() async {
+    final d = own;
     if (await hasSharedStorageAccess()) {
       await writeAutoBackup(d);
       return;
@@ -3719,6 +3961,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   }
 
   Future<void> persist() async {
+    // دايمًا بيحفظ بيانات التليفون ده بس (عمر ما نسخة التليفون التاني بتتحفظ مكانها)
+    final d = own;
     await Store.save(d);
     _backupTimer?.cancel();
     _backupTimer = Timer(const Duration(seconds: 4), () => writeAutoBackup(d));
@@ -3726,6 +3970,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   }
 
   Future<void> openForm(String type, {Txn? existing, Bill? bill, String? billMonth, String? personId}) async {
+    if (blockedInView()) return;
     final r = await Navigator.push<TxnFormResult>(
       context,
       MaterialPageRoute(
@@ -3766,6 +4011,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
 
   /// ملف التحويل ← واتساب (أو أي برنامج)
   Future<void> sendTransfer(Txn t) async {
+    final d = own;
     try {
       Directory out;
       try {
@@ -3786,6 +4032,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
 
   /// استلام تحويل من التليفون التاني (بإيدك من أي فولدر)
   Future<void> receiveTransfer() async {
+    if (blockedInView()) return;
+    final d = own;
     await getAppFolder(requestPermissions: true);
     final files = await listTransferFiles(d);
     if (!mounted) return;
@@ -3839,16 +4087,92 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     if (mounted) toast(context, r.message, bad: !r.ok);
   }
 
-  /// البادج اللي فوق ← تغيير اسم التليفون
+  /// البادج اللي فوق ← تبديل الفرجة بين التليفونين (تغيير الاسم من الإعدادات بس)
   Future<void> phoneSheet() async {
-    final n = await askText(context, 'اسم التليفون ده', initial: d.phoneName, hint: 'مثلاً: تليفون أحمد');
-    if (n == null) return;
-    d.phoneName = n;
-    await persist();
+    final ps = own.knownPeers();
+    final pick = await showModalBottomSheet<String>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 18, 16, 12),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            const Text('تتفرج على أنهي تليفون؟', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 10),
+            _phoneChoice(c, '', '${own.badgeName} (ده)', 'تليفونك — تقدر تسجّل وتعدّل', !viewOnly, C.gold),
+            for (final p in ps) ...[
+              const SizedBox(height: 8),
+              _phoneChoice(c, p.id, p.label,
+                  'آخر نسخة: ${fmtStamp(p.at)}${p.partial ? ' • نسخة قديمة' : ''} — فرجة بس', _viewPid == p.id, C.blue),
+            ],
+            if (ps.isEmpty) ...[
+              const SizedBox(height: 12),
+              const Text('لسه ماستلمتش نسخة من التليفون التاني — دوس تحديث',
+                  textAlign: TextAlign.center, style: TextStyle(color: C.muted)),
+              const SizedBox(height: 8),
+              FilledButton.icon(
+                onPressed: () => Navigator.pop(c, '#sync'),
+                icon: const Icon(Icons.sync_rounded),
+                label: const Text('تحديث'),
+              ),
+            ],
+          ]),
+        ),
+      ),
+    );
+    if (pick == null || !mounted) return;
+    if (pick == '#sync') {
+      await syncNow();
+      if (!mounted) return;
+      final ps2 = own.knownPeers();
+      if (ps2.isNotEmpty) viewPeer(ps2.first.id);
+      return;
+    }
+    if (pick.isEmpty) {
+      exitView();
+    } else {
+      viewPeer(pick);
+    }
+  }
+
+  Widget _phoneChoice(BuildContext c, String id, String title, String sub, bool selected, Color color) => ListTile(
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14), side: BorderSide(color: selected ? color : C.line, width: selected ? 1.6 : 1)),
+        tileColor: selected ? color.withValues(alpha: 0.10) : null,
+        leading: Icon(id.isEmpty ? Icons.phone_android_rounded : Icons.visibility_rounded, color: color),
+        title: Text(title, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800)),
+        subtitle: Text(sub, style: const TextStyle(color: C.muted, fontSize: 12)),
+        trailing: selected ? Icon(Icons.check_circle_rounded, color: color) : null,
+        onTap: () => Navigator.pop(c, id),
+      );
+
+  /// عملية في وضع الفرجة: تفاصيل بس
+  Future<void> showTxnInfo(Txn t) async {
+    final v = d;
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Text('${kTypeLabels[t.type] ?? t.type} • ${egp(t.amount)}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            Text('التاريخ: ${arDateShort(t.date)}', style: const TextStyle(color: C.muted)),
+            if (t.placeId.isNotEmpty) Text('المكان: ${v.placeName(t.placeId)}', style: const TextStyle(color: C.muted)),
+            if (t.toPlaceId.isNotEmpty) Text('لـ: ${v.placeName(t.toPlaceId)}', style: const TextStyle(color: C.muted)),
+            if (t.category.isNotEmpty) Text('البند: ${t.group.isEmpty ? '' : '${t.group} • '}${t.category}', style: const TextStyle(color: C.muted)),
+            if (t.personId.isNotEmpty) Text('الشخص: ${v.personById(t.personId)?.name ?? ''}', style: const TextStyle(color: C.muted)),
+            if (t.note.isNotEmpty) Text('ملاحظة: ${t.note}', style: const TextStyle(color: C.muted)),
+            const SizedBox(height: 12),
+            Text('ده ${phoneWord(viewName)} — التعديل من عليه هو', style: const TextStyle(color: C.blue, fontWeight: FontWeight.w700)),
+          ]),
+        ),
+      ),
+    );
   }
 
   /// «ابعت نسختي»: الشهر ده أو كل الشهور + القوايم ← واتساب
   Future<void> sendCopy() async {
+    final d = own;
     final scope = await showModalBottomSheet<String>(
       context: context,
       builder: (c) => SafeArea(
@@ -3898,6 +4222,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
 
   /// اختيار فولدر الاستلام (بيتحفظ)
   Future<bool> chooseSyncFolder() async {
+    final d = own;
     await getAppFolder(requestPermissions: true);
     if (!mounted) return false;
     final p = await Navigator.push<String>(context, MaterialPageRoute(builder: (_) => FolderPickerScreen(current: d.syncFolder)));
@@ -3909,6 +4234,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
 
   /// «تحديث»: أحدث نسخة من التليفون التاني من الفولدر المحفوظ + القوايم + التحويلات
   Future<void> syncNow() async {
+    final d = own;
     if (d.syncFolder.isEmpty) {
       final ok = await chooseSyncFolder();
       if (!ok || !mounted) return;
@@ -3961,6 +4287,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     if (listsAdded > 0) msgs.add('اتضاف $listsAdded من القوايم');
     if (changed) await persist();
     if (!mounted) return;
+    _refreshView();
     // التحويلات: كل واحد بيختار المكان اللي هيدخله (ولو اتلغى يفضل للمرة الجاية)
     var trDone = 0;
     for (final j in plan.transfers) {
@@ -3981,6 +4308,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
 
   /// «ابدأ بأرصدتك»: كل الأماكن في شاشة واحدة
   Future<void> openStartBalances() async {
+    if (blockedInView()) return;
+    final d = own;
     final ok = await Navigator.push<bool>(context, MaterialPageRoute(builder: (_) => StartBalancesScreen(data: d)));
     if (ok == true) {
       await persist();
@@ -3988,9 +4317,11 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> openTxn(Txn t) => openForm(t.type, existing: t, bill: t.type == tBill ? d.billById(t.billId) : null);
+  Future<void> openTxn(Txn t) =>
+      viewOnly ? showTxnInfo(t) : openForm(t.type, existing: t, bill: t.type == tBill ? d.billById(t.billId) : null);
 
   Future<void> deleteTxn(Txn t) async {
+    if (blockedInView()) return;
     final ok = await confirmDialog(context, 'مسح العملية؟', '${kTypeLabels[t.type]} ${egp(t.amount)} • ${arDateShort(t.date)}',
         yes: 'امسح', danger: true);
     if (!ok) return;
@@ -4002,6 +4333,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   void goTab(int i) => setState(() => tab = i);
 
   void quickAdd() {
+    if (blockedInView()) return;
     showModalBottomSheet(
       context: context,
       builder: (c) => SafeArea(
@@ -4064,19 +4396,31 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         titleSpacing: 16,
         title: const BrandHeader(small: true),
         actions: [
-          Center(child: PhoneBadge(data: d, onTap: phoneSheet)),
+          Center(child: PhoneBadge(data: d, onTap: phoneSheet, viewing: viewOnly)),
           IconButton(
             tooltip: 'الإعدادات',
             icon: const Icon(Icons.tune_rounded),
             onPressed: () async {
+              exitView(); // الإعدادات دايمًا بتاعة التليفون ده
               await Navigator.push(context, MaterialPageRoute(builder: (_) => SettingsScreen(shell: this)));
               await persist();
             },
           ),
         ],
       ),
-      body: pages[tab],
-      floatingActionButton: tab <= 2
+      body: viewOnly
+          ? Column(children: [
+              ViewBanner(
+                name: viewName,
+                at: viewInfo?.at ?? '',
+                partial: viewInfo?.partial ?? false,
+                onSync: syncNow,
+                onBack: exitView,
+              ),
+              Expanded(child: pages[tab]),
+            ])
+          : pages[tab],
+      floatingActionButton: tab <= 2 && !viewOnly
           ? FloatingActionButton.extended(
               onPressed: tab == 2 ? () => openForm(tAdvance) : quickAdd,
               icon: const Icon(Icons.add_rounded),
@@ -4116,7 +4460,7 @@ class HomeTab extends StatelessWidget {
     final due = d.dueBills(mk, DateTime.now());
     final recent = d.monthTxns(mk).take(5).toList();
     return ListView(padding: const EdgeInsets.fromLTRB(16, 6, 16, 100), children: [
-      if (d.isEmptyStart)
+      if (d.isEmptyStart && !shell.viewOnly)
         Padding(
           padding: const EdgeInsets.only(bottom: 12),
           child: InkWell(
@@ -4188,7 +4532,8 @@ class HomeTab extends StatelessWidget {
             ),
         ]),
       ),
-      const SizedBox(height: 12),
+      if (!shell.viewOnly) const SizedBox(height: 12),
+      if (!shell.viewOnly)
       Row(children: [
         for (final t in [tExpense, tWithdraw, tAdd, tTransfer])
           Expanded(
@@ -4211,35 +4556,6 @@ class HomeTab extends StatelessWidget {
             ),
           ),
       ]),
-      const SizedBox(height: 10),
-      Row(children: [
-        Expanded(
-          child: FilledButton.icon(
-            style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
-            onPressed: shell.syncNow,
-            icon: const Icon(Icons.sync_rounded),
-            label: const Text('تحديث', style: TextStyle(fontWeight: FontWeight.w800)),
-          ),
-        ),
-        const SizedBox(width: 8),
-        Expanded(
-          child: OutlinedButton.icon(
-            style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
-            onPressed: shell.sendCopy,
-            icon: const Icon(Icons.ios_share_rounded),
-            label: Text('ابعت نسختي لـ ${d.otherName}', maxLines: 1, overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontWeight: FontWeight.w700)),
-          ),
-        ),
-      ]),
-      const SizedBox(height: 8),
-      OutlinedButton.icon(
-        style: OutlinedButton.styleFrom(
-            padding: const EdgeInsets.symmetric(vertical: 12), side: BorderSide(color: C.blue.withValues(alpha: 0.7))),
-        onPressed: () => shell.openForm(tToPhone),
-        icon: const Icon(Icons.send_to_mobile_rounded, color: C.blue),
-        label: Text('حوّل فلوس لـ ${d.otherName}', style: const TextStyle(fontWeight: FontWeight.w800)),
-      ),
       if (due.isNotEmpty) ...[
         const SectionTitle('فواتير لازم تتدفع'),
         for (final b in due)
@@ -4252,8 +4568,9 @@ class HomeTab extends StatelessWidget {
               leading: const Icon(Icons.notifications_active_rounded, color: C.red),
               title: Text(b.name, style: const TextStyle(fontWeight: FontWeight.w800)),
               subtitle: Text(billDueText(b, mk), style: const TextStyle(color: C.muted)),
-              trailing: FilledButton(
-                  onPressed: () => shell.openForm(tBill, bill: b, billMonth: mk), child: const Text('ادفع')),
+              trailing: shell.viewOnly
+                  ? null
+                  : FilledButton(onPressed: () => shell.openForm(tBill, bill: b, billMonth: mk), child: const Text('ادفع')),
             ),
           ),
       ],
@@ -4271,11 +4588,13 @@ class HomeTab extends StatelessWidget {
       SectionTitle('آخر العمليات',
           trailing: TextButton(onPressed: () => shell.goTab(1), child: const Text('الكل'))),
       if (recent.isEmpty)
-        const Padding(
-          padding: EdgeInsets.all(20),
-          child: Text('لسه مفيش عمليات الشهر ده — دوس «تسجيل» تحت', textAlign: TextAlign.center, style: TextStyle(color: C.muted)),
+        Padding(
+          padding: const EdgeInsets.all(20),
+          child: Text(shell.viewOnly ? 'مفيش عمليات الشهر ده' : 'لسه مفيش عمليات الشهر ده — دوس «تسجيل» تحت',
+              textAlign: TextAlign.center, style: const TextStyle(color: C.muted)),
         ),
-      for (final t in recent) TxnTile(data: d, t: t, onTap: () => shell.openTxn(t), onLongPress: () => shell.deleteTxn(t)),
+      for (final t in recent)
+        TxnTile(data: d, t: t, onTap: () => shell.openTxn(t), onLongPress: shell.viewOnly ? null : () => shell.deleteTxn(t)),
     ]);
   }
 
@@ -4365,6 +4684,7 @@ class _PlaceDetailsScreenState extends State<PlaceDetailsScreen> {
           ]),
         ),
         const SizedBox(height: 12),
+        if (!widget.shell.viewOnly)
         Row(children: [
           Expanded(
             child: FilledButton.icon(
@@ -4589,6 +4909,7 @@ class _PersonAdvancesScreenState extends State<PersonAdvancesScreen> {
           Expanded(child: _box('الباقي', egp(rem), rem > 0 ? C.gold : C.emerald)),
         ]),
         const SizedBox(height: 12),
+        if (!widget.shell.viewOnly)
         Row(children: [
           Expanded(
             child: FilledButton.icon(
@@ -4642,6 +4963,7 @@ class BillsTab extends StatelessWidget {
   const BillsTab({super.key, required this.shell});
 
   Future<void> editBill(BuildContext context, {Bill? b}) async {
+    if (shell.blockedInView()) return;
     final d = shell.d;
     final r = await showDialog<Bill>(context: context, builder: (_) => BillDialog(bill: b, names: List.of(d.billNames)));
     if (r == null) return;
@@ -5002,39 +5324,28 @@ class _MonthTabState extends State<MonthTab> {
         ]),
       ),
       const SectionTitle('حسب التليفون'),
-      _phoneRow('${d.badgeName} (ده)', own, C.gold),
+      _phoneRow(sh.viewOnly ? d.badgeName : '${d.badgeName} (ده)', own, C.gold),
       for (final m in imports)
         _phoneRow('${m.phoneName} • استلمته ${arDateShort(m.exportedAt.length >= 10 ? m.exportedAt.substring(0, 10) : isoDate(DateTime.now()))}',
             d.importedSummary(m), C.emerald,
-            onRemove: () async {
+            onRemove: sh.viewOnly ? null : () async {
               final ok = await confirmDialog(context, 'تشيل ملف ${m.phoneName}؟', 'هيتشال من إجمالي ${monthLabel(mk)} بس',
                   yes: 'شيله', danger: true);
               if (!ok) return;
               d.imported.remove(m.key);
               await sh.persist();
             }),
+      if (!sh.viewOnly)
       Padding(
         padding: const EdgeInsets.only(top: 6),
-        child: Row(children: [
-          Expanded(
-            child: FilledButton.icon(
-              style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
-              onPressed: busy ? null : sh.syncNow,
-              icon: const Icon(Icons.sync_rounded),
-              label: const Text('تحديث', style: TextStyle(fontWeight: FontWeight.w800)),
-            ),
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: OutlinedButton.icon(
-              style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
-              onPressed: busy ? null : sh.sendCopy,
-              icon: const Icon(Icons.ios_share_rounded),
-              label: Text('ابعت نسختي لـ ${d.otherName}', maxLines: 1, overflow: TextOverflow.ellipsis),
-            ),
-          ),
-        ]),
+        child: FilledButton.icon(
+          style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
+          onPressed: busy ? null : sh.syncNow,
+          icon: const Icon(Icons.sync_rounded),
+          label: const Text('تحديث', style: TextStyle(fontWeight: FontWeight.w800)),
+        ),
       ),
+      if (!sh.viewOnly)
       Wrap(alignment: WrapAlignment.center, children: [
         TextButton.icon(
           onPressed: busy ? null : receiveMonth,
@@ -5295,7 +5606,7 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  MoneyData get d => widget.shell.d;
+  MoneyData get d => widget.shell.own;
 
   Future<void> save() async {
     await widget.shell.persist();
@@ -5584,6 +5895,50 @@ class _SettingsScreenState extends State<SettingsScreen> {
           subtitle: Text(d.billNames.isEmpty ? 'لسه مفيش' : d.billNames.join('، '),
               maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: C.muted, fontSize: 12)),
           onTap: () => manageList('أسماء الفواتير', d.billNames, 'اسم فاتورة جديد'),
+        ),
+        SectionTitle('المزامنة مع ${d.otherName}'),
+        const Text('«تحديث» بياخد آخر نسخة من التليفون التاني من فولدر الاستلام. '
+            '«ابعت نسختي» بتبعت عملياتك وأرصدتك عشان التليفون التاني يقدر يتفرج عليها.',
+            style: TextStyle(color: C.muted, fontSize: 12)),
+        const SizedBox(height: 8),
+        FilledButton.icon(
+          style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
+          onPressed: () async {
+            await widget.shell.syncNow();
+            if (mounted) setState(() {});
+          },
+          icon: const Icon(Icons.sync_rounded),
+          label: const Text('تحديث', style: TextStyle(fontWeight: FontWeight.w800)),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
+          onPressed: widget.shell.sendCopy,
+          icon: const Icon(Icons.ios_share_rounded),
+          label: Text('ابعت نسختي لـ ${d.otherName}', textAlign: TextAlign.center, softWrap: true,
+              style: const TextStyle(fontWeight: FontWeight.w700)),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(
+              padding: const EdgeInsets.symmetric(vertical: 13), side: BorderSide(color: C.blue.withValues(alpha: 0.7))),
+          onPressed: () async {
+            await widget.shell.openForm(tToPhone);
+            if (mounted) setState(() {});
+          },
+          icon: const Icon(Icons.send_to_mobile_rounded, color: C.blue),
+          label: Text('حوّل فلوس لـ ${d.otherName}', textAlign: TextAlign.center, softWrap: true,
+              style: const TextStyle(fontWeight: FontWeight.w800)),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 12)),
+          onPressed: () async {
+            await widget.shell.receiveTransfer();
+            if (mounted) setState(() {});
+          },
+          icon: const Icon(Icons.install_mobile_rounded, color: C.emerald),
+          label: Text('استلم تحويل من ${d.otherName}', textAlign: TextAlign.center, softWrap: true),
         ),
         const SectionTitle('القوايم بين التليفونين'),
         const Text('ابعت الأسرة والبنود والفواتير والأماكن لتليفون تاني بدل ما تكتبهم من جديد. '
