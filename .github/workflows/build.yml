@@ -1,0 +1,306 @@
+name: Build A2R Money APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # نسخة فلاتر متثبتة (نفس اللي اتجرب عليها الكود) عشان البناء ميتكسرش فجأة
+          flutter-version: '3.50.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Create Flutter project + pubspec.yaml
+        run: |
+          test -f main.dart || { echo "::error title=ملف ناقص::main.dart مش موجود في أول الريبو"; exit 1; }
+          flutter create --org com.a2r --project-name a2r_money --platforms android temp_app
+          cp -r temp_app/android ./android
+          rm -rf temp_app
+          mkdir -p lib
+          cp main.dart lib/main.dart
+          cat > pubspec.yaml <<'PUBSPEC'
+          name: a2r_money
+          description: A2R Money - balances, expenses, advances and bills
+          publish_to: 'none'
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.2.0 <4.0.0'
+
+          # النسخ متثبتة بالظبط عشان أي تحديث من برّه ميكسرش البناء فجأة
+          dependencies:
+            flutter:
+              sdk: flutter
+            shared_preferences: 2.5.6
+            excel: 4.0.6
+            archive: 3.6.1
+            xml: 6.6.1
+            path_provider: 2.1.6
+            permission_handler: 11.4.0
+            share_plus: 10.1.4
+            open_filex: 4.7.0
+
+          # نفس اللي في A2R Team: نسخ أندرويد من غير JNI
+          dependency_overrides:
+            path_provider_android: 2.2.23
+            shared_preferences_android: 2.4.23
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+
+          flutter:
+            uses-material-design: true
+          PUBSPEC
+          cat pubspec.yaml
+
+      - name: Configure Android (name, id, permissions)
+        run: |
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q 'android:label="a2r_money"' "$M" || { echo "::error::label not found in manifest"; exit 1; }
+          sed -i 's/android:label="a2r_money"/android:label="A2R Money"/' "$M"
+          sed -i '/<application/i \    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>' "$M"
+          sed -i 's/<application/<application android:allowBackup="false"/' "$M"
+          G=android/app/build.gradle.kts
+          sed -i 's/applicationId = "[^"]*"/applicationId = "com.a2r.money"/' "$G"
+          grep -q 'applicationId = "com.a2r.money"' "$G" || { echo "::error::applicationId not set"; exit 1; }
+          grep -q 'android:label="A2R Money"' "$M" && grep -q 'allowBackup="false"' "$M" && grep -q MANAGE_EXTERNAL_STORAGE "$M" || { echo "::error::manifest edit failed"; exit 1; }
+          cat "$M"
+
+      - name: App icon (A2R Money)
+        run: |
+          R=android/app/src/main/res
+          # الأيقونة جاية في ملف واحد icon.zip (أسهل في الرفع من الموبايل) — أو فولدر icon لو مرفوع
+          if [ -f icon.zip ]; then rm -rf icon && mkdir -p icon && unzip -o -q icon.zip -d icon; fi
+          for d in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            for f in ic_launcher ic_launcher_round ic_launcher_foreground ic_launcher_background; do
+              test -f "icon/res/mipmap-$d/$f.png" || { echo "::error title=الأيقونة::ناقص icon/res/mipmap-$d/$f.png — ارفع ملف icon.zip في أول الريبو"; exit 1; }
+            done
+            mkdir -p "$R/mipmap-$d"
+            cp icon/res/mipmap-$d/*.png "$R/mipmap-$d/"
+          done
+          mkdir -p "$R/mipmap-anydpi-v26"
+          cp icon/res/mipmap-anydpi-v26/ic_launcher.xml icon/res/mipmap-anydpi-v26/ic_launcher_round.xml "$R/mipmap-anydpi-v26/"
+          sed -i 's#android:icon="@mipmap/ic_launcher"#android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round"#' android/app/src/main/AndroidManifest.xml
+          grep -q 'roundIcon' android/app/src/main/AndroidManifest.xml || { echo "::error::roundIcon not set"; exit 1; }
+          find "$R" -name 'ic_launcher*' | sort
+
+      # توقيع ثابت — كل نسخة بنفس التوقيع، فالتحديث بيتثبت فوق القديم من غير ما تمسح التطبيق.
+      # المفتاح بيتعمل من «جملة سر» واحدة في Secrets باسم A2R_SIGN_SECRET (مفيش ملف مفتاح في الريبو خالص).
+      - name: Signing key (ثابت من A2R_SIGN_SECRET)
+        env:
+          A2R_SIGN_SECRET: ${{ secrets.A2R_SIGN_SECRET }}
+        run: |
+          if [ ${#A2R_SIGN_SECRET} -lt 12 ]; then
+            echo "::warning title=التوقيع::مفيش Secret اسمه A2R_SIGN_SECRET (أو أقصر من 12 حرف) — النسخة دي متوقعة بمفتاح مؤقت وهتتطلب مسح التطبيق القديم"
+            echo "### ⚠️ التوقيع: مفتاح مؤقت (ضيف Secret اسمه A2R_SIGN_SECRET علشان التوقيع يثبت)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          KS_DIR="$RUNNER_TEMP/a2rks"
+          mkdir -p "$KS_DIR"
+          chmod 700 "$KS_DIR"
+          cat > "$KS_DIR/a2r_sign.py" <<'PYSIGN'
+          #!/usr/bin/env python3
+          # A2R Money: deterministic signing key from ONE secret phrase (GitHub secret A2R_SIGN_SECRET).
+          # Same phrase -> same RSA key + same certificate on every build -> APK signature never changes.
+          # Pure Python (no pip). Writes key.pem + cert.pem; the workflow packs them into a .p12 with openssl.
+          import hashlib, hmac, sys, os
+
+          def drbg(seed):
+              c = 0
+              while True:
+                  yield hashlib.sha256(seed + c.to_bytes(8, 'big')).digest()
+                  c += 1
+
+          class Rnd:
+              def __init__(self, seed):
+                  self.g = drbg(seed); self.buf = b''
+              def bytes(self, n):
+                  while len(self.buf) < n:
+                      self.buf += next(self.g)
+                  out, self.buf = self.buf[:n], self.buf[n:]
+                  return out
+              def int_below(self, n):
+                  k = (n.bit_length() + 7) // 8 + 8
+                  return int.from_bytes(self.bytes(k), 'big') % n
+
+          SMALL = [p for p in range(3, 2000, 2) if all(p % d for d in range(3, int(p ** 0.5) + 1, 2))]
+
+          def is_probable_prime(n, r):
+              if n < 2: return False
+              for p in SMALL:
+                  if n % p == 0: return n == p
+              d, s = n - 1, 0
+              while d % 2 == 0: d //= 2; s += 1
+              for _ in range(48):
+                  a = 2 + r.int_below(n - 3)
+                  x = pow(a, d, n)
+                  if x in (1, n - 1): continue
+                  for _ in range(s - 1):
+                      x = pow(x, 2, n)
+                      if x == n - 1: break
+                  else:
+                      return False
+              return True
+
+          def gen_prime(r, bits, e):
+              while True:
+                  c = int.from_bytes(r.bytes(bits // 8), 'big') | (3 << (bits - 2)) | 1
+                  if (c - 1) % e == 0: continue
+                  if is_probable_prime(c, r): return c
+
+          def der_len(n):
+              if n < 0x80: return bytes([n])
+              b = n.to_bytes((n.bit_length() + 7) // 8, 'big'); return bytes([0x80 | len(b)]) + b
+          def tlv(tag, body): return bytes([tag]) + der_len(len(body)) + body
+          def dint(v):
+              b = v.to_bytes(max(1, (v.bit_length() + 8) // 8), 'big'); return tlv(0x02, b)
+          def seq(*xs): return tlv(0x30, b''.join(xs))
+          def oid(s):
+              p = [int(x) for x in s.split('.')]; out = bytes([40 * p[0] + p[1]])
+              for v in p[2:]:
+                  enc = [v & 0x7f]; v >>= 7
+                  while v: enc.append(0x80 | (v & 0x7f)); v >>= 7
+                  out += bytes(reversed(enc))
+              return tlv(0x06, out)
+          def utf8(s): return tlv(0x0c, s.encode())
+          def gtime(s): return tlv(0x18, s.encode())
+          def pem(label, der):
+              import base64
+              b = base64.b64encode(der).decode()
+              return f'-----BEGIN {label}-----\n' + '\n'.join(b[i:i + 64] for i in range(0, len(b), 64)) + f'\n-----END {label}-----\n'
+
+          def build(secret):
+              seed = hmac.new(secret.encode(), b'a2r-money-apk-signing-v1', hashlib.sha256).digest()
+              r = Rnd(seed); e = 65537
+              while True:
+                  p = gen_prime(r, 1024, e); q = gen_prime(r, 1024, e)
+                  if p == q: continue
+                  if p < q: p, q = q, p
+                  n = p * q
+                  if n.bit_length() == 2048: break
+              d = pow(e, -1, (p - 1) * (q - 1))
+              key = seq(dint(0), dint(n), dint(e), dint(d), dint(p), dint(q), dint(d % (p - 1)), dint(d % (q - 1)), dint(pow(q, -1, p)))
+              sha256rsa = seq(oid('1.2.840.113549.1.1.11'), tlv(0x05, b''))
+              name = seq(tlv(0x31, seq(oid('2.5.4.3'), utf8('A2R Money'))), tlv(0x31, seq(oid('2.5.4.10'), utf8('A2R'))))
+              spki = seq(seq(oid('1.2.840.113549.1.1.1'), tlv(0x05, b'')), tlv(0x03, b'\x00' + seq(dint(n), dint(e))))
+              tbs = seq(tlv(0xa0, dint(2)), dint(1), sha256rsa, name,
+                        seq(gtime('20260101000000Z'), gtime('20760101000000Z')), name, spki)
+              h = hashlib.sha256(tbs).digest()
+              di = seq(seq(oid('2.16.840.1.101.3.4.2.1'), tlv(0x05, b'')), tlv(0x04, h))
+              k = 256
+              em = b'\x00\x01' + b'\xff' * (k - len(di) - 3) + b'\x00' + di
+              sig = pow(int.from_bytes(em, 'big'), d, n).to_bytes(k, 'big')
+              cert = seq(tbs, sha256rsa, tlv(0x03, b'\x00' + sig))
+              return pem('RSA PRIVATE KEY', key), pem('CERTIFICATE', cert), hashlib.sha256(cert).hexdigest()
+
+          if __name__ == '__main__':
+              secret = os.environ.get('A2R_SIGN_SECRET', '')
+              if len(secret) < 12:
+                  print('secret too short'); sys.exit(2)
+              out = sys.argv[1] if len(sys.argv) > 1 else '.'
+              k, c, fp = build(secret)
+              open(os.path.join(out, 'key.pem'), 'w').write(k)
+              open(os.path.join(out, 'cert.pem'), 'w').write(c)
+              print('cert sha256:', fp)
+          PYSIGN
+          python3 "$KS_DIR/a2r_sign.py" "$KS_DIR"
+          PW=$(printf '%s' "$A2R_SIGN_SECRET:a2r-money-store" | sha256sum | cut -c1-32)
+          echo "::add-mask::$PW"
+          openssl pkcs12 -export -inkey "$KS_DIR/key.pem" -in "$KS_DIR/cert.pem" -name a2r -passout "pass:$PW" \
+            -keypbe AES-256-CBC -certpbe AES-256-CBC -macalg sha256 -out "$KS_DIR/a2r.p12"
+          rm -f "$KS_DIR/key.pem" "$KS_DIR/a2r_sign.py"
+          FP=$(openssl x509 -in "$KS_DIR/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)
+          echo "A2R_KS=$KS_DIR/a2r.p12" >> "$GITHUB_ENV"
+          echo "A2R_KS_PW=$PW" >> "$GITHUB_ENV"
+          echo "A2R_CERT_FP=$FP" >> "$GITHUB_ENV"
+          python3 - <<'PYGR'
+          import glob, re
+          f = glob.glob('android/app/build.gradle.kts')
+          assert f, 'build.gradle.kts not found'
+          f = f[0]
+          s = open(f, encoding='utf-8').read()
+          cfg = (
+              '    signingConfigs {\n'
+              '        create("a2r") {\n'
+              '            storeFile = file(System.getenv("A2R_KS"))\n'
+              '            storeType = "pkcs12"\n'
+              '            storePassword = System.getenv("A2R_KS_PW")\n'
+              '            keyAlias = "a2r"\n'
+              '            keyPassword = System.getenv("A2R_KS_PW")\n'
+              '            enableV1Signing = true\n'
+              '            enableV2Signing = true\n'
+              '        }\n'
+              '    }\n\n')
+          assert s.count('    buildTypes {') == 1, 'buildTypes block not found'
+          s = s.replace('    buildTypes {', cfg + '    buildTypes {', 1)
+          s, n = re.subn(r'signingConfig\s*=\s*signingConfigs\.getByName\("debug"\)', 'signingConfig = signingConfigs.getByName("a2r")', s)
+          assert n == 1, 'release signingConfig line not found'
+          open(f, 'w', encoding='utf-8').write(s)
+          print(s)
+          PYGR
+          echo "### 🔏 التوقيع ثابت — بصمة الشهادة: \`$FP\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "(لازم البصمة دي تفضل هي هي في كل نسخة)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies
+        run: |
+          rm -f analysis_options.yaml
+          flutter pub get
+          echo "--- JNI deps (لازم تكون فاضية) ---"
+          flutter pub deps --style=compact | grep -i "jni" || echo "no jni"
+
+      - name: Analyze (يوقف البناء لو في خطأ في الكود)
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings lib/main.dart
+
+      - name: Build release APK
+        run: |
+          set -o pipefail
+          if ! flutter build apk --release --build-name=1.0.${{ github.run_number }} --build-number=${{ github.run_number }} --dart-define=APP_VERSION=1.0.${{ github.run_number }} 2>&1 | tee /tmp/build.log; then
+            MSG=$(grep -E '^e: |error:|What went wrong|Execution failed|FAILURE|AAPT|Could not|Manifest merger' -A3 /tmp/build.log | head -45 | cut -c1-300 | sed 's/%/%25/g' | awk 'BEGIN{ORS="%0A"}{print}')
+            echo "::error title=build-summary::${MSG}"
+            exit 1
+          fi
+          cp build/app/outputs/flutter-apk/app-release.apk A2R-Money.apk
+          AS=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)apksigner
+          if [ -x "$AS" ]; then
+            GOT=$("$AS" verify --print-certs A2R-Money.apk | grep -m1 'SHA-256 digest' | awk '{print $NF}')
+            echo "APK cert SHA-256: $GOT"
+            WANT=$(echo "${A2R_CERT_FP:-}" | tr -d ':' | tr 'A-F' 'a-f')
+            if [ -n "$WANT" ] && [ "$GOT" != "$WANT" ]; then
+              echo "::error title=التوقيع::الـ APK متوقع بمفتاح غير المتوقع ($GOT)"
+              exit 1
+            fi
+            echo "- توقيع الـ APK: \`$GOT\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload APK (Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: A2R-Money-1.0.${{ github.run_number }}
+          path: A2R-Money.apk
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: A2R Money v1.0.${{ github.run_number }}
+          files: A2R-Money.apk
