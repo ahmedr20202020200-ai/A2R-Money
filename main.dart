@@ -273,6 +273,11 @@ const String tTransfer = 'transfer'; // تحويل من مكان لمكان
 const String tAdvance = 'advance'; // سلفة لشخص (من مكان)
 const String tRepay = 'repay'; // رد سلفة (لمكان)
 const String tBill = 'bill'; // دفع فاتورة (من مكان)
+const String tToPhone = 'tophone'; // تحويل للتليفون التاني (من مكان) — مش صرف
+const String tFromPhone = 'fromphone'; // استلام تحويل من التليفون الأساسي (لمكان) — مش دخل جديد
+
+/// مصدر «إضافة رصيد» اللي بيتحسب استلام من الأساسي (لو اتسجل بإيد)
+const String kFromMainSource = 'من التليفون الأساسي';
 
 const Map<String, String> kTypeLabels = {
   tExpense: 'مصروف',
@@ -282,6 +287,8 @@ const Map<String, String> kTypeLabels = {
   tAdvance: 'سلفة',
   tRepay: 'رد سلفة',
   tBill: 'فاتورة',
+  tToPhone: 'تحويل للتليفون التاني',
+  tFromPhone: 'استلام من الأساسي',
 };
 
 /// العمليات اللي الفلوس فيها «خارجة» من المكان
@@ -290,7 +297,8 @@ bool isOut(String type) =>
     type == tWithdraw ||
     type == tAdvance ||
     type == tBill ||
-    type == tTransfer;
+    type == tTransfer ||
+    type == tToPhone;
 
 const String kPlaceCash = 'cash';
 const String kPlaceBank = 'bank';
@@ -387,6 +395,7 @@ class Txn {
   String billId;
   String billMonth;
   String note; // السبب/المصدر (اختياري)
+  String refId; // استلام تحويل: رقم التحويل اللي جه من الأساسي (عشان مايتسجلش مرتين)
   String createdAt;
   Txn({
     required this.id,
@@ -401,6 +410,7 @@ class Txn {
     this.billId = '',
     this.billMonth = '',
     this.note = '',
+    this.refId = '',
     String? createdAt,
   }) : createdAt = createdAt ?? DateTime.now().toIso8601String();
 
@@ -417,6 +427,7 @@ class Txn {
         if (billId.isNotEmpty) 'billId': billId,
         if (billMonth.isNotEmpty) 'billMonth': billMonth,
         if (note.isNotEmpty) 'note': note,
+        if (refId.isNotEmpty) 'refId': refId,
         'createdAt': createdAt,
       };
   factory Txn.fromJson(Map<String, dynamic> j) => Txn(
@@ -432,6 +443,7 @@ class Txn {
         billId: '${j['billId'] ?? ''}',
         billMonth: '${j['billMonth'] ?? ''}',
         note: '${j['note'] ?? ''}',
+        refId: '${j['refId'] ?? ''}',
         createdAt: '${j['createdAt'] ?? ''}',
       );
   Txn copy() => Txn.fromJson(toJson());
@@ -496,6 +508,13 @@ class ImportedMonth {
       );
 }
 
+class TransferResult {
+  final bool ok;
+  final String message;
+  final Txn? txn;
+  const TransferResult(this.ok, this.message, {this.txn});
+}
+
 class ImportResult {
   final bool ok;
   final bool replaced;
@@ -513,6 +532,8 @@ class MonthSummary {
   int advancesGiven = 0;
   int advancesBack = 0;
   int transfers = 0;
+  int toPhone = 0; // اتحول للتليفون التاني (مش صرف)
+  int fromPhone = 0; // اتاستلم من الأساسي (مش صرف ولا دخل جديد)
   final Map<String, int> byGroup = {};
   final Map<String, int> byCategory = {}; // «المجموعة • البند»
   final Map<String, int> byPerson = {}; // اسم الفرد ← المصروف
@@ -528,6 +549,8 @@ class MonthSummary {
     advancesGiven += o.advancesGiven;
     advancesBack += o.advancesBack;
     transfers += o.transfers;
+    toPhone += o.toPhone;
+    fromPhone += o.fromPhone;
     count += o.count;
     void mrg(Map<String, int> a, Map<String, int> b) =>
         b.forEach((k, v) => a[k] = (a[k] ?? 0) + v);
@@ -559,7 +582,18 @@ MonthSummary summarize(
         s.withdraws += t.amount;
         break;
       case tAdd:
-        s.added += t.amount;
+        // «إضافة رصيد» مصدرها «من التليفون الأساسي» = استلام تحويل، مش فلوس جديدة
+        if (sameLabel(t.note, kFromMainSource)) {
+          s.fromPhone += t.amount;
+        } else {
+          s.added += t.amount;
+        }
+        break;
+      case tToPhone:
+        s.toPhone += t.amount;
+        break;
+      case tFromPhone:
+        s.fromPhone += t.amount;
         break;
       case tAdvance:
         s.advancesGiven += t.amount;
@@ -937,6 +971,78 @@ class MoneyData {
     return s;
   }
 
+  /// أول مرة: مفيش أرصدة ولا عمليات ← «ابدأ بأرصدتك»
+  bool get isEmptyStart => txns.isEmpty && places.every((p) => p.opening == 0);
+
+  /// أرصدة البداية لكل الأماكن مرة واحدة (null = سيبه زي ما هو)
+  void setOpenings(Map<String, int?> byPlaceId) {
+    byPlaceId.forEach((id, v) {
+      final p = placeById(id);
+      if (p != null && v != null) p.opening = v;
+    });
+  }
+
+  // ---------- تحويل للتليفون التاني ----------
+  /// ملف التحويل (صغير) اللي بيتبعت للتليفون التاني
+  Map<String, dynamic> transferPayload(Txn t) => {
+        'app': kAppName,
+        'type': 'transfer',
+        'format': 1,
+        'id': t.id,
+        'amount': t.amount,
+        'date': t.date,
+        'note': t.note,
+        'fromPhoneId': phoneId,
+        'fromPhoneName': phoneName.isEmpty ? 'التليفون الأساسي' : phoneName,
+        'createdAt': t.createdAt,
+      };
+
+  bool hasReceivedTransfer(String transferId) =>
+      transferId.isNotEmpty && txns.any((t) => t.type == tFromPhone && t.refId == transferId);
+
+  /// استلام ملف تحويل: بيعمل «استلام من الأساسي» في المكان المختار. نفس الملف مرتين = مرفوض.
+  TransferResult importTransferJson(dynamic raw, String placeId) {
+    if (raw is! Map) return const TransferResult(false, 'الملف ده مش ملف تحويل من A2R Money');
+    final j = Map<String, dynamic>.from(raw);
+    if (j['app'] != kAppName || j['type'] != 'transfer') {
+      return const TransferResult(false, 'الملف ده مش ملف تحويل من A2R Money');
+    }
+    final id = '${j['id'] ?? ''}';
+    final amt = (j['amount'] as num?)?.toInt() ?? 0;
+    final date = '${j['date'] ?? ''}';
+    if (id.isEmpty || amt <= 0 || !RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(date)) {
+      return const TransferResult(false, 'ملف التحويل ناقص أو بايظ');
+    }
+    if ('${j['fromPhoneId'] ?? ''}' == phoneId) {
+      return const TransferResult(false, 'التحويل ده طالع من التليفون ده نفسه — افتحه على التليفون التاني');
+    }
+    if (hasReceivedTransfer(id)) return const TransferResult(false, 'التحويل ده اتسجل قبل كده');
+    if (placeById(placeId) == null) return const TransferResult(false, 'اختار المكان اللي الفلوس هتدخله');
+    final note = '${j['note'] ?? ''}'.trim();
+    final t = Txn(
+      id: newId('tx'),
+      type: tFromPhone,
+      amount: amt,
+      date: date,
+      placeId: placeId,
+      note: note,
+      refId: id,
+    );
+    upsert(t);
+    return TransferResult(true, 'اتسجل ${egp(amt)} من «${j['fromPhoneName'] ?? 'الأساسي'}» في ${placeName(placeId)}', txn: t);
+  }
+
+  /// مقارنة التحويلات في شهر (على الأساسي): اللي اتبعت ← واللي التليفون التاني قال إنه استلمه
+  ({int sent, int received, bool hasOther}) transferCheck(String mk) {
+    final sent = ownSummary(mk).toPhone;
+    var rec = 0;
+    final others = importedFor(mk);
+    for (final m in others) {
+      rec += importedSummary(m).fromPhone;
+    }
+    return (sent: sent, received: rec, hasOther: others.isNotEmpty);
+  }
+
   // ---------- ملف الشهر (من التليفون التاني) ----------
   Map<String, dynamic> exportMonth(String mk) {
     final ts = monthTxns(mk);
@@ -1194,6 +1300,8 @@ List<int>? buildMonthExcel(MoneyData d, String mk) {
     ['الفلوس اللي اتضافت', pounds(all.added)],
     ['سلف اتدفعت', pounds(all.advancesGiven)],
     ['سلف رجعت', pounds(all.advancesBack)],
+    ['اتحول للتليفون التاني (مش صرف)', pounds(own.toPhone)],
+    ['التليفون التاني استلم من الأساسي (مش صرف)', pounds(all.fromPhone)],
     ['', ''],
     ['حسب التليفون', ''],
     [ownName, pounds(own.totalSpend)],
@@ -1405,6 +1513,43 @@ Future<List<FoundFile>> listMonthFiles(String ownPhoneId) async {
   return out;
 }
 
+const String kTransferFilePrefix = 'A2R_Money_Transfer_';
+
+/// ملفات التحويل اللي جاية من الأساسي (واتساب / Download / فولدر التطبيق)
+Future<List<FoundFile>> listTransferFiles(MoneyData d) async {
+  final out = <FoundFile>[];
+  final seen = <String>{};
+  final ids = <String>{};
+  final dirs = <String>[...kExtraFolders];
+  try {
+    final dir = await getAppFolder(requestPermissions: false);
+    dirs.insert(0, '${dir.path}/Transfers');
+  } catch (_) {}
+  for (final p in dirs) {
+    try {
+      final dd = Directory(p);
+      if (!await dd.exists()) continue;
+      await for (final e in dd.list()) {
+        if (e is! File || !seen.add(e.path)) continue;
+        final n = e.uri.pathSegments.last;
+        if (!n.endsWith('.json') || !n.startsWith(kTransferFilePrefix)) continue;
+        final j = await _readJson(e);
+        if (j == null || j['app'] != kAppName || j['type'] != 'transfer') continue;
+        if ('${j['fromPhoneId']}' == d.phoneId) continue;
+        final id = '${j['id']}';
+        if (!ids.add(id)) continue; // نفس التحويل في فولدرين
+        final when = DateTime.tryParse('${j['createdAt'] ?? ''}') ?? await e.lastModified();
+        final amt = (j['amount'] as num?)?.toInt() ?? 0;
+        final done = d.hasReceivedTransfer(id);
+        out.add(FoundFile(e, when,
+            '${egp(amt)} • ${arDateShort('${j['date']}')}${done ? ' • اتسجل قبل كده' : ''}', j));
+      }
+    } catch (_) {}
+  }
+  out.sort((a, b) => b.when.compareTo(a.when));
+  return out;
+}
+
 Future<void> _prune(Directory b, String prefix, int keep) async {
   final files = <File>[];
   await for (final e in b.list()) {
@@ -1554,6 +1699,10 @@ IconData typeIcon(String t) {
       return Icons.keyboard_return_rounded;
     case tBill:
       return Icons.receipt_long_rounded;
+    case tToPhone:
+      return Icons.send_to_mobile_rounded;
+    case tFromPhone:
+      return Icons.install_mobile_rounded;
   }
   return Icons.circle;
 }
@@ -1562,8 +1711,10 @@ Color typeColor(String t) {
   switch (t) {
     case tAdd:
     case tRepay:
+    case tFromPhone:
       return C.emerald;
     case tTransfer:
+    case tToPhone:
       return C.blue;
     case tAdvance:
       return C.violet;
@@ -1940,6 +2091,10 @@ class TxnTile extends StatelessWidget {
         return 'سلفة لـ ${data.personName(t.personId)}';
       case tRepay:
         return 'رد سلفة من ${data.personName(t.personId)}';
+      case tToPhone:
+        return 'اتحول للتليفون التاني';
+      case tFromPhone:
+        return 'استلام من التليفون الأساسي';
     }
     return t.type;
   }
@@ -1956,7 +2111,7 @@ class TxnTile extends StatelessWidget {
       if ((t.type == tExpense || t.type == tWithdraw) && t.group.isNotEmpty) t.group,
       if ((t.type == tExpense || t.type == tWithdraw || t.type == tBill) && t.personId.isNotEmpty) data.personName(t.personId),
     ];
-    final inc = t.type == tAdd || t.type == tRepay;
+    final inc = t.type == tAdd || t.type == tRepay || t.type == tFromPhone;
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),
       child: Material(
@@ -2024,7 +2179,8 @@ class TxnFormScreen extends StatefulWidget {
 class TxnFormResult {
   final Txn? saved;
   final bool deleted;
-  const TxnFormResult({this.saved, this.deleted = false});
+  final bool resend; // ابعت ملف التحويل تاني
+  const TxnFormResult({this.saved, this.deleted = false, this.resend = false});
 }
 
 class _TxnFormScreenState extends State<TxnFormScreen> {
@@ -2090,6 +2246,10 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
         return 'الفلوس اتضافت لـ فين؟';
       case tRepay:
         return 'الفلوس اللي رجعت دخلت فين؟';
+      case tFromPhone:
+        return 'الفلوس دخلت فين؟';
+      case tToPhone:
+        return 'هتتحول من أنهي مكان؟';
       case tTransfer:
         return 'من مكان';
       default:
@@ -2132,6 +2292,7 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
       billId: widget.bill?.id ?? widget.existing?.billId ?? '',
       billMonth: widget.billMonth ?? widget.existing?.billMonth ?? '',
       note: noteCtl.text.trim(),
+      refId: widget.existing?.refId ?? '',
       createdAt: widget.existing?.createdAt,
     );
     // تحذير بس (مش منع) لو مكان هيبقى بالسالب
@@ -2449,8 +2610,27 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
           label: Text('${arabicWeekdays[date.weekday - 1]} ${arDate(date)}'),
         ),
         const SizedBox(height: 14),
-        if (type == tAdd) noteSuggestions(d.sources),
+        // «من التليفون الأساسي» دايمًا موجود كاختيار (لو التحويل اتسجل بإيد من غير ملف)
+        if (type == tAdd)
+          noteSuggestions([
+            ...d.sources.where((x) => !sameLabel(x, kFromMainSource)),
+            kFromMainSource,
+          ]),
         if (type == tWithdraw) noteSuggestions(d.reasons),
+        if (type == tToPhone) ...[
+          Container(
+            padding: const EdgeInsets.all(12),
+            margin: const EdgeInsets.only(bottom: 12),
+            decoration: BoxDecoration(
+                color: C.blue.withValues(alpha: 0.10),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: C.blue.withValues(alpha: 0.4))),
+            child: const Text(
+                'الفلوس دي بتتخصم من المكان هنا، ومش بتتحسب صرف. بعد ما تسجّل هتبعت ملف صغير على واتساب للتليفون التاني، '
+                'وهو يدوس «استلم تحويل من الأساسي» فتدخل عنده.',
+                style: TextStyle(fontSize: 12.5)),
+          ),
+        ],
         TextField(
           controller: noteCtl,
           maxLines: 2,
@@ -2462,6 +2642,14 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
                     : 'ملاحظة (اختياري)',
           ),
         ),
+        if (editing && type == tToPhone) ...[
+          const SizedBox(height: 14),
+          OutlinedButton.icon(
+            onPressed: () => Navigator.pop(context, const TxnFormResult(resend: true)),
+            icon: const Icon(Icons.send_rounded),
+            label: const Text('ابعت ملف التحويل تاني'),
+          ),
+        ],
       ]),
       bottomNavigationBar: SafeArea(
         child: Padding(
@@ -2752,6 +2940,10 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       await persist(); // ممكن يكون اتضاف شخص أو بند
       return;
     }
+    if (r.resend && existing != null) {
+      await sendTransfer(existing);
+      return;
+    }
     if (r.deleted && existing != null) {
       d.removeTxn(existing.id);
       await persist();
@@ -2765,7 +2957,98 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         final t = r.saved!;
         toast(context,
             '${kTypeLabels[t.type]} ${egp(t.amount)} • ${d.placeName(t.placeId)} دلوقتي ${egp(d.balanceOf(t.placeId))}');
+        if (t.type == tToPhone && existing == null) {
+          final go = await confirmDialog(context, 'تبعت التحويل؟',
+              'هيتعمل ملف صغير بـ ${egp(t.amount)} تبعته على واتساب للتليفون التاني.\n'
+                  'وتقدر تبعته تاني بعدين من العملية نفسها.',
+              yes: 'ابعته', no: 'بعدين');
+          if (go) await sendTransfer(t);
+        }
       }
+    }
+  }
+
+  /// ملف التحويل ← واتساب (أو أي برنامج)
+  Future<void> sendTransfer(Txn t) async {
+    try {
+      Directory out;
+      try {
+        final dir = await getAppFolder();
+        out = Directory('${dir.path}/Transfers');
+        if (!await out.exists()) await out.create(recursive: true);
+      } catch (_) {
+        out = await getTemporaryDirectory();
+      }
+      final f = File('${out.path}/$kTransferFilePrefix${t.date}_${t.id.substring(max(0, t.id.length - 8))}.json');
+      await f.writeAsString(jsonEncode(d.transferPayload(t)), flush: true);
+      await Share.shareXFiles([XFile(f.path, mimeType: 'application/json')],
+          text: 'A2R Money — تحويل ${egp(t.amount)} للتليفون التاني');
+    } catch (e) {
+      if (mounted) toast(context, 'الملف ماتبعتش: $e', bad: true);
+    }
+  }
+
+  /// استلام تحويل من الأساسي (على التليفون التاني)
+  Future<void> receiveTransfer() async {
+    await getAppFolder(requestPermissions: true);
+    final files = await listTransferFiles(d);
+    if (!mounted) return;
+    final pick = await showModalBottomSheet<FoundFile>(
+      context: context,
+      isScrollControlled: true,
+      builder: (c) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 18, 16, 12),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            const Text('تحويلات من الأساسي', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+            const Text('من واتساب و Download — افتح الملف في الشات مرة الأول عشان يتنزل', style: TextStyle(color: C.muted, fontSize: 12)),
+            const SizedBox(height: 10),
+            if (files.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text('مفيش ملفات تحويل. خلي التليفون الأساسي يسجّل «تحويل للتليفون التاني» ويبعت الملف على واتساب.',
+                    style: TextStyle(color: C.muted)),
+              ),
+            Flexible(
+              child: ListView(shrinkWrap: true, children: [
+                for (final f in files)
+                  ListTile(
+                    leading: Icon(Icons.install_mobile_rounded,
+                        color: d.hasReceivedTransfer('${f.json['id']}') ? C.muted : C.emerald),
+                    title: Text(f.label, style: const TextStyle(fontWeight: FontWeight.w700)),
+                    subtitle: Text(
+                        [
+                          'من ${f.json['fromPhoneName'] ?? 'الأساسي'}',
+                          if ('${f.json['note'] ?? ''}'.trim().isNotEmpty) '${f.json['note']}',
+                        ].join(' • '),
+                        style: const TextStyle(color: C.muted, fontSize: 12)),
+                    onTap: () => Navigator.pop(c, f),
+                  ),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+    if (pick == null || !mounted) return;
+    if (d.hasReceivedTransfer('${pick.json['id']}')) {
+      toast(context, 'التحويل ده اتسجل قبل كده', bad: true);
+      return;
+    }
+    final amt = (pick.json['amount'] as num?)?.toInt() ?? 0;
+    final placeId = await pickPlace(context, d, title: 'الـ ${egp(amt)} هتدخل فين؟');
+    if (placeId == null || !mounted) return;
+    final r = d.importTransferJson(pick.json, placeId);
+    if (r.ok) await persist();
+    if (mounted) toast(context, r.message, bad: !r.ok);
+  }
+
+  /// «ابدأ بأرصدتك»: كل الأماكن في شاشة واحدة
+  Future<void> openStartBalances() async {
+    final ok = await Navigator.push<bool>(context, MaterialPageRoute(builder: (_) => StartBalancesScreen(data: d)));
+    if (ok == true) {
+      await persist();
+      if (mounted) toast(context, 'اتحفظت الأرصدة • الإجمالي ${egp(d.totalBalance)}');
     }
   }
 
@@ -2798,12 +3081,16 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
               crossAxisSpacing: 10,
               physics: const NeverScrollableScrollPhysics(),
               children: [
-                for (final t in [tExpense, tWithdraw, tAdd, tTransfer, tAdvance, tRepay])
+                for (final t in [tExpense, tWithdraw, tAdd, tTransfer, tAdvance, tRepay, d.isMain ? tToPhone : tFromPhone])
                   InkWell(
                     borderRadius: BorderRadius.circular(18),
                     onTap: () {
                       Navigator.pop(c);
-                      openForm(t);
+                      if (t == tFromPhone) {
+                        receiveTransfer();
+                      } else {
+                        openForm(t);
+                      }
                     },
                     child: Container(
                       decoration: BoxDecoration(
@@ -2813,7 +3100,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                       child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
                         Icon(typeIcon(t), color: typeColor(t), size: 30),
                         const SizedBox(height: 6),
-                        Text(kTypeLabels[t]!, style: const TextStyle(fontWeight: FontWeight.w800)),
+                        Text(t == tToPhone ? 'للتليفون التاني' : t == tFromPhone ? 'استلم تحويل' : kTypeLabels[t]!,
+                            textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w800)),
                       ]),
                     ),
                   ),
@@ -2892,6 +3180,35 @@ class HomeTab extends StatelessWidget {
     final due = d.dueBills(mk, DateTime.now());
     final recent = d.monthTxns(mk).take(5).toList();
     return ListView(padding: const EdgeInsets.fromLTRB(16, 6, 16, 100), children: [
+      if (d.isEmptyStart)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 12),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(22),
+            onTap: shell.openStartBalances,
+            child: Container(
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(22),
+                color: C.gold.withValues(alpha: 0.12),
+                border: Border.all(color: C.gold, width: 1.4),
+              ),
+              child: const Row(children: [
+                Icon(Icons.account_balance_wallet_rounded, color: C.gold, size: 34),
+                SizedBox(width: 12),
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('ابدأ بأرصدتك', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w900, color: C.gold)),
+                    SizedBox(height: 2),
+                    Text('اكتب الفلوس اللي معاك دلوقتي في كل مكان (كاش، بنك، محفظة) مرة واحدة',
+                        style: TextStyle(fontSize: 12.5, color: C.muted)),
+                  ]),
+                ),
+                Icon(Icons.chevron_left_rounded, color: C.gold),
+              ]),
+            ),
+          ),
+        ),
       Container(
         padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
@@ -2958,6 +3275,17 @@ class HomeTab extends StatelessWidget {
             ),
           ),
       ]),
+      const SizedBox(height: 10),
+      OutlinedButton.icon(
+        style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 13),
+            side: BorderSide(color: (d.isMain ? C.blue : C.emerald).withValues(alpha: 0.7))),
+        onPressed: d.isMain ? () => shell.openForm(tToPhone) : shell.receiveTransfer,
+        icon: Icon(d.isMain ? Icons.send_to_mobile_rounded : Icons.install_mobile_rounded,
+            color: d.isMain ? C.blue : C.emerald),
+        label: Text(d.isMain ? 'حوّل للتليفون التاني' : 'استلم تحويل من الأساسي',
+            style: const TextStyle(fontWeight: FontWeight.w800)),
+      ),
       if (due.isNotEmpty) ...[
         const SectionTitle('فواتير لازم تتدفع'),
         for (final b in due)
@@ -3181,7 +3509,7 @@ class _RecordsTabState extends State<RecordsTab> {
       SingleChildScrollView(
         scrollDirection: Axis.horizontal,
         child: Row(children: [
-          for (final f in ['', tExpense, tBill, tWithdraw, tAdd, tTransfer, tAdvance, tRepay])
+          for (final f in ['', tExpense, tBill, tWithdraw, tAdd, tTransfer, tAdvance, tRepay, tToPhone, tFromPhone])
             Padding(
               padding: const EdgeInsetsDirectional.only(end: 6),
               child: ChoiceChip(
@@ -3698,6 +4026,7 @@ class _MonthTabState extends State<MonthTab> {
     final own = d.ownSummary(mk);
     final imports = d.importedFor(mk);
     final all = d.combinedSummary(mk);
+    final tc = d.transferCheck(mk);
     final maxG = all.byGroup.values.fold<int>(1, max);
     return ListView(padding: const EdgeInsets.fromLTRB(16, 6, 16, 40), children: [
       MonthSwitcher(month: mk, onChanged: sh.setMonth),
@@ -3743,7 +4072,7 @@ class _MonthTabState extends State<MonthTab> {
             label: const Text('استلم ملف الشهر من التليفون التاني'),
           ),
         )
-      else
+      else ...[
         Padding(
           padding: const EdgeInsets.only(top: 6),
           child: FilledButton.icon(
@@ -3751,6 +4080,60 @@ class _MonthTabState extends State<MonthTab> {
             onPressed: busy ? null : sendMonth,
             icon: const Icon(Icons.send_rounded),
             label: Text('ابعت ملف ${monthLabel(mk)} للتليفون الأساسي'),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: OutlinedButton.icon(
+            onPressed: busy ? null : sh.receiveTransfer,
+            icon: const Icon(Icons.install_mobile_rounded, color: C.emerald),
+            label: const Text('استلم تحويل من الأساسي'),
+          ),
+        ),
+      ],
+      if (d.isMain && (tc.sent > 0 || tc.received > 0))
+        Padding(
+          padding: const EdgeInsets.only(top: 10),
+          child: Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: C.card,
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(color: (tc.hasOther && tc.sent != tc.received ? C.red : C.blue).withValues(alpha: 0.6)),
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+              Row(children: [
+                const Icon(Icons.send_to_mobile_rounded, color: C.blue, size: 20),
+                const SizedBox(width: 8),
+                const Expanded(child: Text('اتحول للتليفون التاني', style: TextStyle(fontWeight: FontWeight.w700))),
+                Text(egp(tc.sent), style: const TextStyle(fontWeight: FontWeight.w900, color: C.blue)),
+              ]),
+              if (tc.hasOther) ...[
+                const SizedBox(height: 6),
+                Row(children: [
+                  const Icon(Icons.install_mobile_rounded, color: C.emerald, size: 20),
+                  const SizedBox(width: 8),
+                  const Expanded(child: Text('التليفون التاني استلم', style: TextStyle(fontWeight: FontWeight.w700))),
+                  Text(egp(tc.received), style: const TextStyle(fontWeight: FontWeight.w900, color: C.emerald)),
+                ]),
+                if (tc.sent != tc.received)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Icon(Icons.warning_amber_rounded, color: C.red, size: 18),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text('مش زي بعض — فرق ${egp((tc.sent - tc.received).abs())}. '
+                            'غالباً في تحويل لسه ماتسجلش على التليفون التاني (أو اتسجل في شهر تاني).',
+                            style: const TextStyle(color: C.red, fontSize: 12)),
+                      ),
+                    ]),
+                  ),
+              ],
+              const SizedBox(height: 6),
+              const Text('التحويلات دي مش بتتحسب صرف — صرف التليفون التاني بيتحسب مرة واحدة من ملف الشهر بتاعه.',
+                  style: TextStyle(color: C.muted, fontSize: 11.5)),
+            ]),
           ),
         ),
       if (all.byGroup.isNotEmpty) ...[
@@ -3790,6 +4173,10 @@ class _MonthTabState extends State<MonthTab> {
           ListTile(dense: true, title: const Text('سلف اتدفعت'), trailing: Text(egp(all.advancesGiven), style: const TextStyle(color: C.violet, fontWeight: FontWeight.w800))),
           ListTile(dense: true, title: const Text('سلف رجعت'), trailing: Text(egp(all.advancesBack), style: const TextStyle(color: C.emerald, fontWeight: FontWeight.w800))),
           ListTile(dense: true, title: const Text('تحويلات بين الأماكن (مش صرف)'), trailing: Text(egp(all.transfers), style: const TextStyle(color: C.blue, fontWeight: FontWeight.w800))),
+          if (own.toPhone > 0)
+            ListTile(dense: true, title: const Text('اتحول للتليفون التاني (مش صرف)'), trailing: Text(egp(own.toPhone), style: const TextStyle(color: C.blue, fontWeight: FontWeight.w800))),
+          if (own.fromPhone > 0)
+            ListTile(dense: true, title: const Text('اتاستلم من الأساسي (مش صرف)'), trailing: Text(egp(own.fromPhone), style: const TextStyle(color: C.emerald, fontWeight: FontWeight.w800))),
         ]),
       ),
       const SizedBox(height: 16),
@@ -3836,6 +4223,125 @@ class _MonthTabState extends State<MonthTab> {
           ),
         ]),
       );
+}
+
+// ==================== ابدأ بأرصدتك ====================
+
+/// النص اللي اتكتب ← قروش (يقبل سالب «-»، فاضي = صفر)
+int? parseOpening(String raw) {
+  final t = raw.trim();
+  if (t.isEmpty) return 0;
+  final neg = t.startsWith('-');
+  final v = parseMoney(neg ? t.substring(1) : t);
+  if (v == null) return null;
+  return neg ? -v : v;
+}
+
+class StartBalancesScreen extends StatefulWidget {
+  final MoneyData data;
+  const StartBalancesScreen({super.key, required this.data});
+  @override
+  State<StartBalancesScreen> createState() => _StartBalancesScreenState();
+}
+
+class _StartBalancesScreenState extends State<StartBalancesScreen> {
+  final ctl = <String, TextEditingController>{};
+  final err = <String, String?>{};
+  MoneyData get d => widget.data;
+
+  @override
+  void initState() {
+    super.initState();
+    for (final p in d.activePlaces) {
+      ctl[p.id] = TextEditingController(text: p.opening == 0 ? '' : money(p.opening).replaceAll(',', ''));
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final c in ctl.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  int get total => ctl.values.fold(0, (s, c) => s + (parseOpening(c.text) ?? 0));
+
+  void save() {
+    final vals = <String, int?>{};
+    var bad = false;
+    ctl.forEach((id, c) {
+      final v = parseOpening(c.text);
+      err[id] = v == null ? 'رقم مش مفهوم' : null;
+      if (v == null) bad = true;
+      vals[id] = v;
+    });
+    setState(() {});
+    if (bad) return;
+    d.setOpenings(vals);
+    Navigator.pop(context, true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final places = d.activePlaces;
+    return Scaffold(
+      appBar: AppBar(title: const Text('ابدأ بأرصدتك')),
+      body: ListView(padding: const EdgeInsets.fromLTRB(16, 8, 16, 120), children: [
+        const Text('اكتب الفلوس اللي معاك دلوقتي في كل مكان. ده «رصيد البداية» — وبعد كده سجّل المصروف والسحب والإضافة عادي.',
+            style: TextStyle(color: C.muted)),
+        if (d.txns.isNotEmpty)
+          const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Text('خد بالك: عندك عمليات متسجلة — رصيد المكان = البداية + العمليات.',
+                style: TextStyle(color: C.gold, fontSize: 12)),
+          ),
+        const SizedBox(height: 12),
+        for (final p in places)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: TextField(
+              controller: ctl[p.id],
+              keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true),
+              inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9٠-٩۰-۹.,٫،\-]'))],
+              onChanged: (_) => setState(() => err[p.id] = null),
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+              decoration: InputDecoration(
+                labelText: p.name,
+                prefixIcon: Icon(placeIcon(p.kind), color: placeColor(p.kind)),
+                suffixText: 'جنيه',
+                hintText: '0',
+                errorText: err[p.id],
+              ),
+            ),
+          ),
+        Container(
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+              color: C.card, borderRadius: BorderRadius.circular(18), border: Border.all(color: C.gold.withValues(alpha: 0.5))),
+          child: Row(children: [
+            const Text('الإجمالي', style: TextStyle(fontWeight: FontWeight.w800)),
+            const Spacer(),
+            Text(egp(total), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900, color: C.gold)),
+          ]),
+        ),
+        const SizedBox(height: 8),
+        const Text('عايز مكان تاني (فودافون كاش، بنك تاني…)؟ ضيفه من الإعدادات في جزء «الأماكن»، وهيظهر هنا.',
+            style: TextStyle(color: C.muted, fontSize: 12)),
+      ]),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 12),
+          child: FilledButton.icon(
+            style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16)),
+            onPressed: save,
+            icon: const Icon(Icons.check_rounded),
+            label: const Text('احفظ الأرصدة', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 // ==================== الإعدادات ====================
@@ -4086,6 +4592,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     child: const Text('رجّعه'))
                 : IconButton(icon: const Icon(Icons.delete_outline_rounded), onPressed: () => removePlace(p)),
           ),
+        OutlinedButton.icon(
+          onPressed: () async {
+            final ok = await Navigator.push<bool>(context, MaterialPageRoute(builder: (_) => StartBalancesScreen(data: d)));
+            if (ok == true) await save();
+          },
+          icon: const Icon(Icons.edit_note_rounded),
+          label: const Text('اكتب رصيد البداية لكل الأماكن مرة واحدة'),
+        ),
         SectionTitle('الأسرة والناس',
             trailing: TextButton.icon(onPressed: () => editPerson(), icon: const Icon(Icons.add_rounded), label: const Text('شخص'))),
         if (d.people.isEmpty) const Text('ضيف الأطفال وأفراد الأسرة عشان تعرف صرف كل واحد', style: TextStyle(color: C.muted)),
