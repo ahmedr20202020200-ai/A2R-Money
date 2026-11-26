@@ -277,7 +277,9 @@ const String tToPhone = 'tophone'; // تحويل للتليفون التاني (
 const String tFromPhone = 'fromphone'; // استلام تحويل من التليفون الأساسي (لمكان) — مش دخل جديد
 
 /// مصدر «إضافة رصيد» اللي بيتحسب استلام من الأساسي (لو اتسجل بإيد)
-const String kFromMainSource = 'من التليفون الأساسي';
+const String kFromMainSource = 'من التليفون التاني';
+const String kFromMainSourceOld = 'من التليفون الأساسي'; // v2 (لسه بيتعرف عليه)
+bool isPhoneSource(String note) => sameLabel(note, kFromMainSource) || sameLabel(note, kFromMainSourceOld);
 
 const Map<String, String> kTypeLabels = {
   tExpense: 'مصروف',
@@ -287,8 +289,8 @@ const Map<String, String> kTypeLabels = {
   tAdvance: 'سلفة',
   tRepay: 'رد سلفة',
   tBill: 'فاتورة',
-  tToPhone: 'تحويل للتليفون التاني',
-  tFromPhone: 'استلام من الأساسي',
+  tToPhone: 'تحويل لتليفون تاني',
+  tFromPhone: 'استلام من تليفون تاني',
 };
 
 /// العمليات اللي الفلوس فيها «خارجة» من المكان
@@ -524,6 +526,52 @@ class ImportResult {
 }
 
 /// ملخص شهر لتليفون واحد
+/// نتيجة ملف القوائم (معاينة أو دمج)
+class ListsResult {
+  final bool ok;
+  final String error;
+  final int people, categories, bills, places, missingPlaces, other;
+  final String fromName;
+  const ListsResult(this.ok, this.error,
+      {this.people = 0,
+      this.categories = 0,
+      this.bills = 0,
+      this.places = 0,
+      this.missingPlaces = 0,
+      this.other = 0,
+      this.fromName = ''});
+  int get total => people + categories + bills + places + other;
+
+  /// «5 أفراد، 12 بند، 3 فواتير…»
+  String describe({bool withPlaces = true}) {
+    String n(int c, String one, String two, String many) =>
+        c == 1 ? one : (c == 2 ? two : '$c $many');
+    final parts = <String>[
+      if (people > 0) n(people, 'فرد واحد', 'فردين', 'أفراد'),
+      if (categories > 0) n(categories, 'بند واحد', 'بندين', 'بنود'),
+      if (bills > 0) n(bills, 'فاتورة واحدة', 'فاتورتين', 'فواتير'),
+      if (withPlaces && places > 0) n(places, 'مكان واحد', 'مكانين', 'أماكن'),
+      if (other > 0) n(other, 'اختيار واحد', 'اختيارين', 'اختيارات (مصادر/أسباب/أسماء فواتير)'),
+    ];
+    return parts.isEmpty ? 'مفيش حاجة جديدة' : parts.join('، ');
+  }
+}
+
+class CopyResult {
+  final bool ok;
+  final String message;
+  final int months, listsAdded;
+  final String fromName, exportedAt;
+  const CopyResult(this.ok, this.message, {this.months = 0, this.listsAdded = 0, this.fromName = '', this.exportedAt = ''});
+}
+
+/// اللي «تحديث» هيعمله
+class SyncPlan {
+  final List<Map<String, dynamic>> copies, months, lists, transfers;
+  const SyncPlan({required this.copies, required this.months, required this.lists, required this.transfers});
+  bool get isEmpty => copies.isEmpty && months.isEmpty && lists.isEmpty && transfers.isEmpty;
+}
+
 class MonthSummary {
   int expenses = 0; // مصروفات (من غير الفواتير)
   int bills = 0;
@@ -583,7 +631,7 @@ MonthSummary summarize(
         break;
       case tAdd:
         // «إضافة رصيد» مصدرها «من التليفون الأساسي» = استلام تحويل، مش فلوس جديدة
-        if (sameLabel(t.note, kFromMainSource)) {
+        if (isPhoneSource(t.note)) {
           s.fromPhone += t.amount;
         } else {
           s.added += t.amount;
@@ -641,11 +689,14 @@ class MoneyData {
   List<Txn> txns;
   Map<String, List<String>> categories;
   Map<String, ImportedMonth> imported;
+  Map<String, String> copySeen; // تليفون ← وقت آخر نسخة كاملة اتاستلمت منه
   String lastPlaceId;
   String lastInPlaceId;
   List<String> sources; // مصادر الفلوس اللي بتدخل (إضافة رصيد)
   List<String> reasons; // أسباب السحب
   List<String> billNames; // أسماء الفواتير اللي اتكتبت قبل كده
+  String peerName; // اسم التليفون التاني (من آخر ملف جه منه)
+  String syncFolder; // فولدر الاستلام اللي اتحدد مرة واحدة ('' = لسه)
 
   MoneyData({
     required this.phoneId,
@@ -657,11 +708,14 @@ class MoneyData {
     List<Txn>? txns,
     Map<String, List<String>>? categories,
     Map<String, ImportedMonth>? imported,
+    Map<String, String>? copySeen,
     this.lastPlaceId = '',
     this.lastInPlaceId = '',
     List<String>? sources,
     List<String>? reasons,
     List<String>? billNames,
+    this.peerName = '',
+    this.syncFolder = '',
   })  : sources = sources ?? [],
         reasons = reasons ?? [],
         billNames = billNames ?? List<String>.from(kDefaultBillNames),
@@ -671,7 +725,8 @@ class MoneyData {
         txns = txns ?? [],
         categories = categories ??
             kDefaultCategories.map((k, v) => MapEntry(k, List<String>.from(v))),
-        imported = imported ?? {};
+        imported = imported ?? {},
+        copySeen = copySeen ?? {};
 
   /// تسطيبة جديدة: فاضية (مفيش أي بيانات شخصية) — بس الأماكن التلاتة الأساسية برصيد صفر
   factory MoneyData.fresh() => MoneyData(
@@ -684,6 +739,23 @@ class MoneyData {
       );
 
   bool get isMain => role != 'second';
+
+  /// اسم التليفون ده (لو فاضي ← الكلام القديم حسب الدور، للنسخ القديمة بس)
+  String get badgeName {
+    final n = cleanLabel(phoneName);
+    return n.isEmpty ? (isMain ? 'الأساسي' : 'التليفون التاني') : n;
+  }
+
+  /// اسم التليفون التاني (اتعرف من آخر ملف جه منه)
+  String get otherName {
+    final n = cleanLabel(peerName);
+    return n.isEmpty ? 'التليفون التاني' : n;
+  }
+
+  void learnPeer(dynamic name) {
+    final n = cleanLabel('${name ?? ''}');
+    if (n.isNotEmpty && n.length <= 60) peerName = n;
+  }
   bool get hasAnyData =>
       txns.isNotEmpty || people.isNotEmpty || bills.isNotEmpty || imported.isNotEmpty ||
       places.any((p) => p.opening != 0);
@@ -700,11 +772,14 @@ class MoneyData {
         'txns': txns.map((e) => e.toJson()).toList(),
         'categories': categories,
         'imported': imported.map((k, v) => MapEntry(k, v.toJson())),
+        'copySeen': copySeen,
         'lastPlaceId': lastPlaceId,
         'lastInPlaceId': lastInPlaceId,
         'sources': sources,
         'reasons': reasons,
         'billNames': billNames,
+        'peerName': peerName,
+        'syncFolder': syncFolder,
       };
 
   factory MoneyData.fromJson(Map<String, dynamic> j) {
@@ -757,11 +832,14 @@ class MoneyData {
       txns: l('txns', Txn.fromJson),
       categories: cats,
       imported: imp,
+      copySeen: (j['copySeen'] is Map) ? (j['copySeen'] as Map).map((k, v) => MapEntry('$k', '$v')) : null,
       lastPlaceId: '${j['lastPlaceId'] ?? ''}',
       lastInPlaceId: '${j['lastInPlaceId'] ?? ''}',
       sources: sl('sources'),
       reasons: sl('reasons'),
       billNames: j['billNames'] is List ? sl('billNames') : null,
+      peerName: '${j['peerName'] ?? ''}',
+      syncFolder: '${j['syncFolder'] ?? ''}',
     );
   }
 
@@ -993,14 +1071,15 @@ class MoneyData {
         'date': t.date,
         'note': t.note,
         'fromPhoneId': phoneId,
-        'fromPhoneName': phoneName.isEmpty ? 'التليفون الأساسي' : phoneName,
+        'fromPhoneName': badgeName,
+        'toPhoneName': peerName,
         'createdAt': t.createdAt,
       };
 
   bool hasReceivedTransfer(String transferId) =>
       transferId.isNotEmpty && txns.any((t) => t.type == tFromPhone && t.refId == transferId);
 
-  /// استلام ملف تحويل: بيعمل «استلام من الأساسي» في المكان المختار. نفس الملف مرتين = مرفوض.
+  /// استلام ملف تحويل: بيعمل «استلام» في المكان المختار. نفس الملف مرتين = مرفوض. (الاتجاهين)
   TransferResult importTransferJson(dynamic raw, String placeId) {
     if (raw is! Map) return const TransferResult(false, 'الملف ده مش ملف تحويل من A2R Money');
     final j = Map<String, dynamic>.from(raw);
@@ -1029,18 +1108,282 @@ class MoneyData {
       refId: id,
     );
     upsert(t);
-    return TransferResult(true, 'اتسجل ${egp(amt)} من «${j['fromPhoneName'] ?? 'الأساسي'}» في ${placeName(placeId)}', txn: t);
+    learnPeer(j['fromPhoneName']);
+    return TransferResult(true, 'اتسجل ${egp(amt)} من «${j['fromPhoneName'] ?? otherName}» في ${placeName(placeId)}', txn: t);
   }
 
-  /// مقارنة التحويلات في شهر (على الأساسي): اللي اتبعت ← واللي التليفون التاني قال إنه استلمه
-  ({int sent, int received, bool hasOther}) transferCheck(String mk) {
-    final sent = ownSummary(mk).toPhone;
-    var rec = 0;
+  /// مقارنة التحويلات في شهر (الاتجاهين): اللي حوّلته ← اللي التاني استلمه، واللي التاني حوّله ← اللي انا استلمته
+  ({int sent, int received, int otherSent, int ownReceived, bool hasOther}) transferCheck(String mk) {
+    final own = ownSummary(mk);
+    var rec = 0, os = 0;
     final others = importedFor(mk);
     for (final m in others) {
-      rec += importedSummary(m).fromPhone;
+      final x = importedSummary(m);
+      rec += x.fromPhone;
+      os += x.toPhone;
     }
-    return (sent: sent, received: rec, hasOther: others.isNotEmpty);
+    return (sent: own.toPhone, received: rec, otherSent: os, ownReceived: own.fromPhone, hasOther: others.isNotEmpty);
+  }
+
+  // ---------- ملف القوائم (الأسرة، البنود، الفواتير…) — من غير أي فلوس ----------
+  /// القوائم بس: أسماء الناس، البنود، الفواتير (كقالب)، المصادر، الأسباب، أسماء الأماكن.
+  /// مفيش فيه: عمليات، أرصدة، رصيد بداية، سلف، دور التليفون.
+  Map<String, dynamic> exportLists() => {
+        'app': kAppName,
+        'type': 'lists',
+        'format': 1,
+        'phoneId': phoneId,
+        'phoneName': badgeName,
+        'exportedAt': DateTime.now().toIso8601String(),
+        'people': [
+          for (final p in people) {'name': p.name, 'family': p.family, 'child': p.child}
+        ],
+        'categories': {for (final e in categories.entries) e.key: List<String>.from(e.value)},
+        'bills': [
+          for (final b in bills)
+            {'name': b.name, 'kind': b.kind, 'dueDay': b.dueDay, 'usual': b.usual, 'active': b.active}
+        ],
+        'billNames': List<String>.from(billNames),
+        'sources': List<String>.from(sources),
+        'reasons': List<String>.from(reasons),
+        'places': [
+          for (final p in places.where((p) => !p.archived)) {'name': p.name, 'kind': p.kind}
+        ],
+      };
+
+  /// دمج ملف قوائم: بيضيف الناقص بس (نفس مطابقة الأسماء: همزات/ة-ه/ى-ي/مسافات)،
+  /// عمره ما بيمسح أو يغيّر اسم موجود، ومش بيلمس الأرصدة ولا العمليات.
+  /// [apply] = false ← حساب بس (للمعاينة) من غير أي تغيير.
+  ListsResult mergeListsJson(dynamic raw, {bool addPlaces = true, bool apply = true}) {
+    if (raw is! Map) return const ListsResult(false, 'الملف ده مش ملف قوائم من A2R Money');
+    final j = Map<String, dynamic>.from(raw);
+    if (j['app'] != kAppName || j['type'] != 'lists') {
+      return const ListsResult(false, 'الملف ده مش ملف قوائم من A2R Money');
+    }
+    final pid = '${j['phoneId'] ?? ''}';
+    if (pid.isEmpty) return const ListsResult(false, 'ملف القوائم ناقص أو بايظ');
+    if (pid == phoneId) {
+      return const ListsResult(false, 'الملف ده طالع من التليفون ده نفسه — افتحه على التليفون التاني');
+    }
+    // المعاينة بتشتغل على نسخة، عشان الحساب يبقى هو هو اللي هيحصل فعلاً
+    final t = apply ? this : MoneyData.fromJson(jsonDecode(jsonEncode(toJson())) as Map<String, dynamic>);
+    const cap = 1000;
+    List<Map<String, dynamic>> maps(String k) => ((j[k] is List) ? j[k] as List : const [])
+        .whereType<Map>()
+        .take(cap)
+        .map((e) => Map<String, dynamic>.from(e))
+        .toList();
+    List<String> strs(dynamic v) =>
+        ((v is List) ? v : const []).take(cap).map((e) => cleanLabel('$e')).where((e) => e.isNotEmpty && e.length <= 80).toList();
+    int addAll(List<String> target, List<String> items) {
+      var n = 0;
+      for (final x in items) {
+        final before = target.length;
+        addChoice(target, x);
+        if (target.length > before) n++;
+      }
+      return n;
+    }
+
+    var nPeople = 0, nCats = 0, nBills = 0, nPlaces = 0, nOther = 0;
+    for (final m in maps('people')) {
+      final name = cleanLabel('${m['name'] ?? ''}');
+      if (name.isEmpty || name.length > 80) continue;
+      if (t.people.any((p) => sameLabel(p.name, name))) continue;
+      t.people.add(Person(id: newId('pe'), name: name, family: m['family'] != false, child: m['child'] == true));
+      nPeople++;
+    }
+    if (j['categories'] is Map) {
+      (j['categories'] as Map).forEach((k, v) {
+        final g = cleanLabel('$k');
+        if (g.isEmpty || g.length > 40) return;
+        nCats += addAll(t.categories.putIfAbsent(g, () => []), strs(v));
+      });
+    }
+    for (final m in maps('bills')) {
+      final name = cleanLabel('${m['name'] ?? ''}');
+      if (name.isEmpty || name.length > 80) continue;
+      t.addBillName(name);
+      if (t.bills.any((b) => sameLabel(b.name, name))) continue;
+      final kind = cleanLabel('${m['kind'] ?? ''}');
+      t.bills.add(Bill(
+        id: newId('bi'),
+        name: name,
+        kind: kind.isEmpty ? 'بيت' : kind,
+        dueDay: ((m['dueDay'] as num?)?.toInt() ?? 1).clamp(1, 31),
+        usual: max(0, (m['usual'] as num?)?.toInt() ?? 0),
+        active: m['active'] != false,
+      ));
+      nBills++;
+    }
+    nOther += addAll(t.billNames, strs(j['billNames']));
+    nOther += addAll(t.sources, strs(j['sources']));
+    nOther += addAll(t.reasons, strs(j['reasons']));
+    final missingPlaces = <Map<String, dynamic>>[];
+    for (final m in maps('places')) {
+      final name = cleanLabel('${m['name'] ?? ''}');
+      if (name.isEmpty || name.length > 60) continue;
+      if (t.places.any((p) => sameLabel(p.name, name))) continue;
+      if (missingPlaces.any((x) => sameLabel('${x['name']}', name))) continue;
+      missingPlaces.add({'name': name, 'kind': m['kind']});
+    }
+    if (addPlaces) {
+      for (final m in missingPlaces) {
+        final k = '${m['kind'] ?? ''}';
+        t.places.add(Place(
+            id: newId('pl'),
+            name: '${m['name']}',
+            kind: const [kPlaceCash, kPlaceBank, kPlaceWallet, kPlaceOther].contains(k) ? k : kPlaceOther));
+        nPlaces++;
+      }
+    }
+    return ListsResult(true, '',
+        people: nPeople,
+        categories: nCats,
+        bills: nBills,
+        places: nPlaces,
+        missingPlaces: missingPlaces.length,
+        other: nOther,
+        fromName: '${j['phoneName'] ?? 'التليفون التاني'}');
+  }
+
+  // ---------- نسخة كاملة (أي وقت، من أي تليفون للتاني) ----------
+  /// شهور التليفون ده اللي فيها عمليات
+  List<String> ownMonths() {
+    final m = <String>{for (final t in txns) if (t.date.length >= 7) t.date.substring(0, 7)};
+    return m.toList()..sort();
+  }
+
+  /// نسختي: عملياتي (شهر واحد أو كل الشهور) + القوايم. مفيش فيها أي حاجة جاتلي من تليفون تاني.
+  Map<String, dynamic> exportCopy({String? month}) {
+    final months = month == null ? ownMonths() : [month];
+    return {
+      'app': kAppName,
+      'type': 'copy',
+      'format': 1,
+      'phoneId': phoneId,
+      'phoneName': badgeName,
+      'exportedAt': DateTime.now().toIso8601String(),
+      'scope': month ?? 'all',
+      'months': [for (final mk in months) exportMonth(mk)],
+      'lists': exportLists(),
+    };
+  }
+
+  /// آخر نسخة استلمتها من تليفون (عشان «تحديث» يعرف لو في أحدث)
+  String lastCopyAt(String fromPhoneId) {
+    var best = '';
+    for (final m in imported.values) {
+      if (m.phoneId == fromPhoneId && m.exportedAt.compareTo(best) > 0) best = m.exportedAt;
+    }
+    final c = copySeen[fromPhoneId] ?? '';
+    return c.compareTo(best) > 0 ? c : best;
+  }
+
+  /// استلام نسخة: بتبدّل اللي جه قبل كده من نفس التليفون (نفس الشهر — أو كل الشهور لو النسخة كاملة).
+  /// أرصدة وعمليات التليفون ده مابتتلمسش. القوايم بيتضاف الناقص منها بس (من غير أماكن).
+  CopyResult importCopyJson(dynamic raw) {
+    if (raw is! Map) return const CopyResult(false, 'الملف ده مش نسخة من A2R Money');
+    final j = Map<String, dynamic>.from(raw);
+    if (j['app'] != kAppName) return const CopyResult(false, 'الملف ده مش نسخة من A2R Money');
+    if (j['type'] == 'month') {
+      final r = importMonthJson(j);
+      return CopyResult(r.ok, r.message, months: r.ok ? 1 : 0, fromName: r.month?.phoneName ?? '', exportedAt: r.month?.exportedAt ?? '');
+    }
+    if (j['type'] != 'copy') return const CopyResult(false, 'الملف ده مش نسخة من A2R Money');
+    final pid = '${j['phoneId'] ?? ''}';
+    if (pid.isEmpty) return const CopyResult(false, 'النسخة ناقصة أو بايظة');
+    if (pid == phoneId) return const CopyResult(false, 'النسخة دي طالعة من التليفون ده نفسه — افتحها على التليفون التاني');
+    final name = cleanLabel('${j['phoneName'] ?? ''}');
+    final at = '${j['exportedAt'] ?? ''}';
+    final scope = '${j['scope'] ?? 'all'}';
+    final ms = ((j['months'] is List) ? j['months'] as List : const []).whereType<Map>().toList();
+    final good = <Map<String, dynamic>>[];
+    for (final m in ms) {
+      final mm = Map<String, dynamic>.from(m);
+      if ('${mm['phoneId']}' != pid || !RegExp(r'^\d{4}-\d{2}$').hasMatch('${mm['month']}')) continue;
+      good.add({...mm, 'app': kAppName, 'type': 'month', 'exportedAt': at, 'phoneName': name.isEmpty ? mm['phoneName'] : name});
+    }
+    if (scope == 'all') {
+      // نسخة كاملة: اللي كان جاي من التليفون ده ومش موجود فيها يتشال (اتمسح عنده)
+      imported.removeWhere((k, v) => v.phoneId == pid);
+    }
+    var n = 0;
+    for (final mm in good) {
+      if (importMonthJson(mm).ok) n++;
+    }
+    var listsAdded = 0;
+    if (j['lists'] is Map) {
+      final lr = mergeListsJson(j['lists'], addPlaces: false);
+      if (lr.ok) listsAdded = lr.total;
+    }
+    copySeen[pid] = at;
+    learnPeer(name);
+    final who = name.isEmpty ? otherName : name;
+    return CopyResult(true, 'اتحدث من «$who» — $n شهر${listsAdded > 0 ? ' • اتضاف $listsAdded من القوايم' : ''}',
+        months: n, listsAdded: listsAdded, fromName: who, exportedAt: at);
+  }
+
+  /// «تحديث»: من كل الملفات اللي في فولدر الاستلام بيختار الأحدث (بالوقت اللي جوه الملف، مش الاسم)
+  SyncPlan planSync(List<Map<String, dynamic>> files) {
+    DateTime? when(Map<String, dynamic> j) => DateTime.tryParse('${j['exportedAt'] ?? j['createdAt'] ?? ''}');
+    final newestCopy = <String, Map<String, dynamic>>{}; // تليفون ← أحدث نسخة كاملة/شهر
+    final newestMonth = <String, Map<String, dynamic>>{}; // تليفون|شهر ← أحدث ملف شهر قديم (v1/v2)
+    final newestLists = <String, Map<String, dynamic>>{};
+    final transfers = <String, Map<String, dynamic>>{};
+    bool newer(Map<String, dynamic> a, Map<String, dynamic>? b) {
+      if (b == null) return true;
+      final wa = when(a), wb = when(b);
+      if (wa == null) return false;
+      if (wb == null) return true;
+      return wa.isAfter(wb);
+    }
+
+    for (final j in files) {
+      if (j['app'] != kAppName) continue;
+      final t = '${j['type']}';
+      if (t == 'transfer') {
+        if ('${j['fromPhoneId']}' == phoneId) continue;
+        final id = '${j['id'] ?? ''}';
+        if (id.isEmpty || hasReceivedTransfer(id)) continue;
+        transfers[id] = j;
+        continue;
+      }
+      final pid = '${j['phoneId'] ?? ''}';
+      if (pid.isEmpty || pid == phoneId || when(j) == null) continue;
+      if (t == 'copy') {
+        if (newer(j, newestCopy[pid])) newestCopy[pid] = j;
+      } else if (t == 'month') {
+        final k = '$pid|${j['month']}';
+        if (newer(j, newestMonth[k])) newestMonth[k] = j;
+      } else if (t == 'lists') {
+        if (newer(j, newestLists[pid])) newestLists[pid] = j;
+      }
+    }
+    final copies = <Map<String, dynamic>>[];
+    newestCopy.forEach((pid, j) {
+      final seen = DateTime.tryParse(lastCopyAt(pid));
+      final w = when(j)!;
+      if (seen == null || w.isAfter(seen)) copies.add(j);
+    });
+    final months = <Map<String, dynamic>>[];
+    newestMonth.forEach((k, j) {
+      final pid = '${j['phoneId']}';
+      final w = when(j)!;
+      // لو في نسخة كاملة أحدث منه هتغطيه
+      final c = newestCopy[pid];
+      if (c != null && !when(c)!.isBefore(w)) return;
+      final old = imported[k];
+      final seen = DateTime.tryParse(old?.exportedAt ?? '');
+      final cs = DateTime.tryParse(copySeen[pid] ?? '');
+      if ((seen == null || w.isAfter(seen)) && (cs == null || w.isAfter(cs))) months.add(j);
+    });
+    final lists = <Map<String, dynamic>>[];
+    newestLists.forEach((pid, j) {
+      if (mergeListsJson(j, apply: false, addPlaces: false).total > 0) lists.add(j);
+    });
+    final tr = transfers.values.toList()..sort((a, b) => '${a['date']}'.compareTo('${b['date']}'));
+    return SyncPlan(copies: copies, months: months, lists: lists, transfers: tr);
   }
 
   // ---------- ملف الشهر (من التليفون التاني) ----------
@@ -1052,7 +1395,7 @@ class MoneyData {
       'type': 'month',
       'format': 1,
       'phoneId': phoneId,
-      'phoneName': phoneName.isEmpty ? 'التليفون التاني' : phoneName,
+      'phoneName': badgeName,
       'month': mk,
       'exportedAt': DateTime.now().toIso8601String(),
       'txns': ts.map((e) => e.toJson()).toList(),
@@ -1078,7 +1421,7 @@ class MoneyData {
     final pid = '${j['phoneId'] ?? ''}';
     if (pid.isEmpty) return const ImportResult(false, 'الملف ناقص (مافيهوش رقم التليفون)');
     if (pid == phoneId) {
-      return const ImportResult(false, 'الملف ده طالع من التليفون ده نفسه — افتحه على التليفون الأساسي');
+      return const ImportResult(false, 'الملف ده طالع من التليفون ده نفسه — افتحه على التليفون التاني');
     }
     final m = ImportedMonth.fromJson(j);
     // نتأكد إن العمليات كلها في نفس الشهر، ومفيش id متكرر جوه الملف
@@ -1102,6 +1445,7 @@ class MoneyData {
     );
     final replaced = imported.containsKey(fixed.key);
     imported[fixed.key] = fixed;
+    learnPeer(fixed.phoneName);
     return ImportResult(
         true,
         replaced
@@ -1300,8 +1644,8 @@ List<int>? buildMonthExcel(MoneyData d, String mk) {
     ['الفلوس اللي اتضافت', pounds(all.added)],
     ['سلف اتدفعت', pounds(all.advancesGiven)],
     ['سلف رجعت', pounds(all.advancesBack)],
-    ['اتحول للتليفون التاني (مش صرف)', pounds(own.toPhone)],
-    ['التليفون التاني استلم من الأساسي (مش صرف)', pounds(all.fromPhone)],
+    ['اتحول لتليفون تاني (مش صرف)', pounds(own.toPhone)],
+    ['اتاستلم من تليفون تاني (مش صرف)', pounds(all.fromPhone)],
     ['', ''],
     ['حسب التليفون', ''],
     [ownName, pounds(own.totalSpend)],
@@ -1422,6 +1766,69 @@ const List<String> kExtraFolders = [
   '/storage/emulated/0/WhatsApp/Media/WhatsApp Documents',
 ];
 
+/// فولدرات مستندات واتساب الموجودة فعلاً على الموبايل — الشكلين:
+///  • العادي: Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Documents
+///  • الجديد (أكتر من حساب): Android/media/com.whatsapp/WhatsApp/accounts/<رقم>/Media/WhatsApp Documents
+/// ونفس الكلام لواتساب بيزنس. الأول في القايمة = الاقتراح الأساسي ([path, الاسم]).
+Future<List<List<String>>> discoverWhatsAppFolders({String root = '/storage/emulated/0'}) async {
+  final out = <List<String>>[];
+  final seen = <String>{};
+  Future<void> add(String path, String label) async {
+    if (seen.contains(path)) return;
+    try {
+      if (await Directory(path).exists()) {
+        seen.add(path);
+        out.add([path, label]);
+      }
+    } catch (_) {}
+  }
+
+  for (final a in const [
+    ['com.whatsapp', 'WhatsApp', 'WhatsApp Documents', 'واتساب'],
+    ['com.whatsapp.w4b', 'WhatsApp Business', 'WhatsApp Business Documents', 'واتساب بيزنس'],
+  ]) {
+    final base = '$root/Android/media/${a[0]}/${a[1]}';
+    // الشكل الجديد: accounts/<أي رقم>/Media/...
+    final accs = <String>[];
+    try {
+      final ad = Directory('$base/accounts');
+      if (await ad.exists()) {
+        await for (final e in ad.list()) {
+          if (e is Directory) accs.add(e.uri.pathSegments.where((x) => x.isNotEmpty).last);
+        }
+      }
+    } catch (_) {}
+    accs.sort();
+    for (final id in accs) {
+      await add('$base/accounts/$id/Media/${a[2]}', accs.length > 1 ? '${a[3]} — مستندات (حساب $id)' : '${a[3]} — مستندات');
+    }
+    // الشكل العادي
+    await add('$base/Media/${a[2]}', accs.isEmpty ? '${a[3]} — مستندات' : '${a[3]} — مستندات (الفولدر العادي)');
+  }
+  // موبايلات قديمة (قبل أندرويد 11)
+  await add('$root/WhatsApp/Media/WhatsApp Documents', 'واتساب — مستندات (موبايل قديم)');
+  await add('$root/WhatsApp Business/Media/WhatsApp Business Documents', 'واتساب بيزنس — مستندات (موبايل قديم)');
+  return out;
+}
+
+/// كل الفولدرات اللي بندوّر فيها بإيد: القايمة القديمة + فولدرات واتساب اللي اتلقت (بالشكلين) + Sent و Private جواها
+Future<List<String>> scanFolders({String root = '/storage/emulated/0'}) async {
+  final out = <String>[];
+  void add(String p) {
+    if (!out.contains(p)) out.add(p);
+  }
+
+  for (final w in await discoverWhatsAppFolders(root: root)) {
+    add(w[0]);
+    add('${w[0]}/Sent');
+    add('${w[0]}/Private');
+  }
+  for (final p in kExtraFolders) {
+    add(root == '/storage/emulated/0' ? p : p.replaceFirst('/storage/emulated/0', root));
+  }
+  return out;
+}
+
 class FoundFile {
   final File file;
   final DateTime when;
@@ -1445,7 +1852,7 @@ Future<List<FoundFile>> listBackups() async {
   Future<void> consider(File f, String kind) async {
     if (!seen.add(f.path)) return;
     final j = await _readJson(f);
-    if (j == null || j['app'] != kAppName || j['places'] is! List) return;
+    if (j == null || j['app'] != kAppName || j['places'] is! List || j['type'] != null) return;
     final when = DateTime.tryParse('${j['savedAt'] ?? ''}') ?? await f.lastModified();
     final n = (j['txns'] as List?)?.length ?? 0;
     out.add(FoundFile(f, when, '$kind • ${arDate(when)} ${two(when.hour)}:${two(when.minute)} • $n عملية', j));
@@ -1465,7 +1872,7 @@ Future<List<FoundFile>> listBackups() async {
       }
     }
   } catch (_) {}
-  for (final p in kExtraFolders) {
+  for (final p in await scanFolders()) {
     try {
       final d = Directory(p);
       if (!await d.exists()) continue;
@@ -1485,7 +1892,7 @@ Future<List<FoundFile>> listBackups() async {
 Future<List<FoundFile>> listMonthFiles(String ownPhoneId) async {
   final out = <FoundFile>[];
   final seen = <String>{};
-  final dirs = <String>[...kExtraFolders];
+  final dirs = <String>[...await scanFolders()];
   try {
     final dir = await getAppFolder(requestPermissions: false);
     dirs.insert(0, '${dir.path}/Months');
@@ -1497,11 +1904,21 @@ Future<List<FoundFile>> listMonthFiles(String ownPhoneId) async {
       await for (final e in d.list()) {
         if (e is! File || !seen.add(e.path)) continue;
         final n = e.uri.pathSegments.last;
-        if (!n.endsWith('.json') || !n.startsWith(kMonthFilePrefix)) continue;
+        if (!n.endsWith('.json') || !n.startsWith('A2R_Money')) continue;
         final j = await _readJson(e);
-        if (j == null || j['app'] != kAppName || j['type'] != 'month') continue;
+        if (j == null || j['app'] != kAppName || (j['type'] != 'month' && j['type'] != 'copy')) continue;
         if ('${j['phoneId']}' == ownPhoneId) continue;
         final when = DateTime.tryParse('${j['exportedAt'] ?? ''}') ?? await e.lastModified();
+        if (j['type'] == 'copy') {
+          final ms = (j['months'] as List?) ?? const [];
+          var cnt = 0;
+          for (final m in ms) {
+            if (m is Map) cnt += (m['txns'] as List?)?.length ?? 0;
+          }
+          out.add(FoundFile(e, when,
+              '${j['phoneName']} • نسخة ${j['scope'] == 'all' ? 'كل الشهور' : monthLabel('${j['scope']}')} • $cnt عملية', j));
+          continue;
+        }
         final mk = '${j['month']}';
         final cnt = (j['txns'] as List?)?.length ?? 0;
         out.add(FoundFile(e, when,
@@ -1515,12 +1932,352 @@ Future<List<FoundFile>> listMonthFiles(String ownPhoneId) async {
 
 const String kTransferFilePrefix = 'A2R_Money_Transfer_';
 
+const String kListsFilePrefix = 'A2R_Money_Lists_';
+const String kCopyFilePrefix = 'A2R_Money_Copy_';
+
+/// فولدرات الاستلام المقترحة (أول واحد = واتساب، هو الاقتراح الأساسي)
+const List<List<String>> kSyncFolderChoices = [
+  ['/storage/emulated/0/Download', 'التنزيلات (Download)'],
+  ['/storage/emulated/0/Documents', 'المستندات (Documents)'],
+];
+
+/// كل ملفات A2R Money (JSON) اللي في فولدر — بالمحتوى مش بالاسم (واتساب ساعات بيزوّد «(1)» للاسم)
+Future<List<Map<String, dynamic>>> readSyncFolder(String path) async {
+  final out = <Map<String, dynamic>>[];
+  final d = Directory(path);
+  if (!await d.exists()) return out;
+  // الفولدر نفسه + Private و Sent جواه (واتساب الجديد ساعات بيحط الملفات فيهم)
+  final ents = <FileSystemEntity>[];
+  for (final dd in [d, Directory('$path/Private'), Directory('$path/Sent')]) {
+    try {
+      if (await dd.exists()) ents.addAll(await dd.list().toList());
+    } catch (_) {}
+  }
+  for (final e in ents) {
+    if (e is! File) continue;
+    final n = e.uri.pathSegments.last.toLowerCase();
+    if (!n.endsWith('.json')) continue;
+    try {
+      if (await e.length() > 8 * 1024 * 1024) continue;
+    } catch (_) {
+      continue;
+    }
+    final j = await _readJson(e);
+    if (j != null && j['app'] == kAppName && j['type'] != null) out.add(j);
+  }
+  return out;
+}
+
+/// عدد ملفات A2R Money في فولدر (للاختيار)
+Future<int> countSyncFiles(String path) async {
+  try {
+    final d = Directory(path);
+    if (!await d.exists()) return -1;
+    var n = 0;
+    await for (final e in d.list()) {
+      if (e is File && e.uri.pathSegments.last.startsWith('A2R_Money') && e.path.endsWith('.json')) n++;
+    }
+    return n;
+  } catch (_) {
+    return -1;
+  }
+}
+
+/// اختيار فولدر الاستلام (مرة واحدة، ويتغير من الإعدادات)
+class FolderPickerScreen extends StatefulWidget {
+  final String current;
+  final String root; // جذر التخزين (للاختبار بس بيتغير)
+  const FolderPickerScreen({super.key, this.current = '', this.root = '/storage/emulated/0'});
+  @override
+  State<FolderPickerScreen> createState() => _FolderPickerScreenState();
+}
+
+class _FolderPickerScreenState extends State<FolderPickerScreen> {
+  Map<String, int> counts = {};
+  List<List<String>> choices = []; // فولدرات واتساب اللي اتلقت الأول، وبعدين Download/Documents
+  bool loaded = false;
+  String? browse; // لو بيتصفح: الفولدر الحالي
+  List<Directory> subs = [];
+
+  @override
+  void initState() {
+    super.initState();
+    () async {
+      final r = widget.root;
+      String fix(String x) => x.replaceFirst('/storage/emulated/0', r);
+      final wa = await discoverWhatsAppFolders(root: r);
+      final list = <List<String>>[
+        ...wa,
+        if (wa.isEmpty) [fix('/storage/emulated/0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Documents'), 'واتساب — مستندات'],
+        for (final c in kSyncFolderChoices) [fix(c[0]), c[1]],
+      ];
+      final m = <String, int>{};
+      for (final c in list) {
+        m[c[0]] = await countSyncFiles(c[0]);
+      }
+      if (mounted) {
+        setState(() {
+          choices = list;
+          counts = m;
+          loaded = true;
+        });
+      }
+    }();
+  }
+
+  Future<void> open(String path) async {
+    final l = <Directory>[];
+    try {
+      await for (final e in Directory(path).list()) {
+        if (e is Directory && !e.uri.pathSegments.where((x) => x.isNotEmpty).last.startsWith('.')) l.add(e);
+      }
+    } catch (_) {}
+    l.sort((a, b) => a.path.toLowerCase().compareTo(b.path.toLowerCase()));
+    setState(() {
+      browse = path;
+      subs = l;
+    });
+  }
+
+  String nameOf(String path) => path.split('/').where((x) => x.isNotEmpty).last;
+
+  @override
+  Widget build(BuildContext context) {
+    if (browse != null) {
+      final b = browse!;
+      final atRoot = b == '/storage/emulated/0';
+      return Scaffold(
+        appBar: AppBar(title: Text(atRoot ? 'ذاكرة الموبايل' : nameOf(b))),
+        body: ListView(padding: const EdgeInsets.fromLTRB(12, 4, 12, 100), children: [
+          Text(b, style: const TextStyle(color: C.muted, fontSize: 11.5), textDirection: TextDirection.ltr),
+          const SizedBox(height: 6),
+          if (!atRoot)
+            ListTile(
+              leading: const Icon(Icons.arrow_upward_rounded),
+              title: const Text('رجوع لفوق'),
+              onTap: () => open(b.substring(0, b.lastIndexOf('/'))),
+            ),
+          if (subs.isEmpty) const Padding(padding: EdgeInsets.all(16), child: Text('مفيش فولدرات جوه ده', style: TextStyle(color: C.muted))),
+          for (final d in subs)
+            ListTile(
+              leading: const Icon(Icons.folder_rounded, color: C.gold),
+              title: Text(nameOf(d.path), textDirection: TextDirection.ltr, textAlign: TextAlign.start),
+              onTap: () => open(d.path),
+            ),
+        ]),
+        bottomNavigationBar: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 12),
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
+              onPressed: () => Navigator.pop(context, b),
+              icon: const Icon(Icons.check_rounded),
+              label: const Text('اختار الفولدر ده'),
+            ),
+          ),
+        ),
+      );
+    }
+    return Scaffold(
+      appBar: AppBar(title: const Text('فولدر الاستلام')),
+      body: ListView(padding: const EdgeInsets.fromLTRB(16, 4, 16, 40), children: [
+        const Text('اختار الفولدر اللي بتنزل فيه الملفات اللي جاية من التليفون التاني. بيتحفظ مرة واحدة، '
+            'وبعد كده زرار «تحديث» بياخد أحدث نسخة منه لوحده. (لازم تفتح الملف في شات واتساب مرة عشان يتنزل)',
+            style: TextStyle(color: C.muted, fontSize: 12.5)),
+        const SizedBox(height: 10),
+        if (!loaded) const Padding(padding: EdgeInsets.all(20), child: Center(child: CircularProgressIndicator())),
+        for (final c in choices)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: ListTile(
+              tileColor: C.card,
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  side: BorderSide(color: widget.current == c[0] ? C.gold : C.line, width: widget.current == c[0] ? 1.6 : 1)),
+              leading: Icon(c[1].startsWith('واتساب') ? Icons.chat_rounded : Icons.folder_rounded,
+                  color: (counts[c[0]] ?? -1) < 0 ? C.muted : C.emerald),
+              title: Text(c[1] + (c == choices.first ? ' (مقترح)' : ''), style: const TextStyle(fontWeight: FontWeight.w700)),
+              subtitle: Text(
+                  !counts.containsKey(c[0])
+                      ? '…'
+                      : counts[c[0]]! < 0
+                          ? 'مش موجود على الموبايل ده'
+                          : counts[c[0]] == 0
+                              ? 'موجود • لسه مفيش ملفات A2R Money'
+                              : 'موجود • فيه ${counts[c[0]]} ملف A2R Money',
+                  style: const TextStyle(color: C.muted, fontSize: 12)),
+              trailing: widget.current == c[0] ? const Icon(Icons.check_circle_rounded, color: C.gold) : null,
+              onTap: () => Navigator.pop(context, c[0]),
+            ),
+          ),
+        const SizedBox(height: 6),
+        OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
+          onPressed: () => open('/storage/emulated/0'),
+          icon: const Icon(Icons.folder_open_rounded),
+          label: const Text('فولدر تاني… (تصفّح)'),
+        ),
+        if (widget.current.isNotEmpty && !choices.any((c) => c[0] == widget.current)) ...[
+          const SizedBox(height: 10),
+          Text('الفولدر الحالي: ${widget.current}', style: const TextStyle(color: C.muted, fontSize: 12), textDirection: TextDirection.ltr),
+        ],
+      ]),
+    );
+  }
+}
+
+/// ملفات القوايم اللي جاية من تليفون تاني (واتساب / Download / فولدر التطبيق)
+Future<List<FoundFile>> listListsFiles(MoneyData d) async {
+  final out = <FoundFile>[];
+  final seen = <String>{};
+  final dirs = <String>[...await scanFolders()];
+  try {
+    final dir = await getAppFolder(requestPermissions: false);
+    dirs.insert(0, '${dir.path}/Lists');
+  } catch (_) {}
+  for (final p in dirs) {
+    try {
+      final dd = Directory(p);
+      if (!await dd.exists()) continue;
+      await for (final e in dd.list()) {
+        if (e is! File || !seen.add(e.path)) continue;
+        final n = e.uri.pathSegments.last;
+        if (!n.endsWith('.json') || !n.startsWith(kListsFilePrefix)) continue;
+        final j = await _readJson(e);
+        if (j == null || j['app'] != kAppName || j['type'] != 'lists') continue;
+        if ('${j['phoneId']}' == d.phoneId) continue;
+        final when = DateTime.tryParse('${j['exportedAt'] ?? ''}') ?? await e.lastModified();
+        final np = (j['people'] as List?)?.length ?? 0;
+        var nc = 0;
+        if (j['categories'] is Map) {
+          for (final v in (j['categories'] as Map).values) {
+            if (v is List) nc += v.length;
+          }
+        }
+        final nb = (j['bills'] as List?)?.length ?? 0;
+        out.add(FoundFile(e, when,
+            '${j['phoneName'] ?? 'تليفون تاني'} • ${arDateShort(isoDate(when))} ${when.hour.toString().padLeft(2, '0')}:${when.minute.toString().padLeft(2, '0')} • $np فرد • $nc بند • $nb فاتورة',
+            j));
+      }
+    } catch (_) {}
+  }
+  out.sort((a, b) => b.when.compareTo(a.when));
+  return out;
+}
+
+/// ملف القوايم ← واتساب (أو أي برنامج)
+Future<void> sendListsFile(BuildContext context, MoneyData d) async {
+  try {
+    Directory out;
+    try {
+      final dir = await getAppFolder();
+      out = Directory('${dir.path}/Lists');
+      if (!await out.exists()) await out.create(recursive: true);
+    } catch (_) {
+      out = await getTemporaryDirectory();
+    }
+    final now = DateTime.now();
+    final stamp = '${isoDate(now)}_${now.hour.toString().padLeft(2, '0')}${now.minute.toString().padLeft(2, '0')}';
+    final f = File('${out.path}/$kListsFilePrefix$stamp.json');
+    await f.writeAsString(jsonEncode(d.exportLists()), flush: true);
+    await Share.shareXFiles([XFile(f.path, mimeType: 'application/json')],
+        text: 'A2R Money — القوايم (الأسرة والبنود والفواتير) من غير أي فلوس');
+  } catch (e) {
+    if (context.mounted) toast(context, 'الملف ماتبعتش: $e', bad: true);
+  }
+}
+
+/// استلام القوايم: اختار ملف ← معاينة («هيتضاف: …») ← دمج من غير تكرار.
+/// بيرجّع true لو اتضاف حاجة (لازم تحفظ بعدها).
+Future<bool> receiveListsFlow(BuildContext context, MoneyData d) async {
+  await getAppFolder(requestPermissions: true);
+  final files = await listListsFiles(d);
+  if (!context.mounted) return false;
+  final pick = await showModalBottomSheet<FoundFile>(
+    context: context,
+    isScrollControlled: true,
+    builder: (c) => SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 18, 16, 12),
+        child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          const Text('ملفات القوايم', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+          const Text('من واتساب و Download — افتح الملف في الشات مرة الأول عشان يتنزل', style: TextStyle(color: C.muted, fontSize: 12)),
+          const SizedBox(height: 10),
+          if (files.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text('مفيش ملفات قوايم. على التليفون التاني: الإعدادات ← «ابعت القوايم لتليفون تاني» وابعته على واتساب.',
+                  style: TextStyle(color: C.muted)),
+            ),
+          Flexible(
+            child: ListView(shrinkWrap: true, children: [
+              for (final f in files)
+                ListTile(
+                  leading: const Icon(Icons.playlist_add_check_rounded, color: C.emerald),
+                  title: Text(f.label, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 13.5)),
+                  onTap: () => Navigator.pop(c, f),
+                ),
+            ]),
+          ),
+        ]),
+      ),
+    ),
+  );
+  if (pick == null || !context.mounted) return false;
+  final preview = d.mergeListsJson(pick.json, apply: false, addPlaces: true);
+  if (!preview.ok) {
+    toast(context, preview.error, bad: true);
+    return false;
+  }
+  if (preview.total == 0) {
+    toast(context, 'كل اللي في الملف موجود عندك — مفيش حاجة جديدة تتضاف');
+    return false;
+  }
+  var addPlaces = true;
+  final go = await showDialog<bool>(
+    context: context,
+    builder: (c) => StatefulBuilder(
+      builder: (c, set) => AlertDialog(
+        title: const Text('تضيف القوايم دي؟', style: TextStyle(fontWeight: FontWeight.w800, fontSize: 18)),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('من «${preview.fromName}»', style: const TextStyle(color: C.muted, fontSize: 12.5)),
+          const SizedBox(height: 8),
+          Text('هيتضاف: ${preview.describe(withPlaces: addPlaces)}', style: const TextStyle(fontWeight: FontWeight.w700)),
+          if (preview.missingPlaces > 0)
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              value: addPlaces,
+              onChanged: (v) => set(() => addPlaces = v ?? true),
+              title: Text('ضيف الأماكن كمان (${preview.missingPlaces}) برصيد صفر', style: const TextStyle(fontSize: 13.5)),
+            ),
+          const SizedBox(height: 6),
+          const Text('بيتضاف الناقص بس — مفيش حاجة عندك هتتمسح أو تتغير، والأرصدة والعمليات زي ما هي.',
+              style: TextStyle(color: C.muted, fontSize: 12)),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('لأ')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('ضيفهم')),
+        ],
+      ),
+    ),
+  );
+  if (go != true || !context.mounted) return false;
+  final r = d.mergeListsJson(pick.json, addPlaces: addPlaces);
+  if (!r.ok) {
+    toast(context, r.error, bad: true);
+    return false;
+  }
+  toast(context, r.total == 0 ? 'مفيش حاجة جديدة' : 'اتضاف: ${r.describe()}');
+  return r.total > 0;
+}
+
+
 /// ملفات التحويل اللي جاية من الأساسي (واتساب / Download / فولدر التطبيق)
 Future<List<FoundFile>> listTransferFiles(MoneyData d) async {
   final out = <FoundFile>[];
   final seen = <String>{};
   final ids = <String>{};
-  final dirs = <String>[...kExtraFolders];
+  final dirs = <String>[...await scanFolders()];
   try {
     final dir = await getAppFolder(requestPermissions: false);
     dirs.insert(0, '${dir.path}/Transfers');
@@ -1739,6 +2496,42 @@ class SectionTitle extends StatelessWidget {
           if (trailing != null) trailing!,
         ]),
       );
+}
+
+/// البادج اللي فوق: اسم التليفون ده. الضغط عليه = تغيير الاسم.
+class PhoneBadge extends StatelessWidget {
+  final MoneyData data;
+  final VoidCallback onTap;
+  const PhoneBadge({super.key, required this.data, required this.onTap});
+  @override
+  Widget build(BuildContext context) {
+    const color = C.gold;
+    return Tooltip(
+      message: 'اسم التليفون ده — دوس عشان تغيّره',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: onTap,
+        child: Container(
+          constraints: const BoxConstraints(maxWidth: 150),
+          padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+          decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.16),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: color.withValues(alpha: 0.5))),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.phone_android_rounded, size: 14, color: color),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text(data.badgeName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 11.5, color: color, fontWeight: FontWeight.w700)),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
 }
 
 class Pill extends StatelessWidget {
@@ -2092,9 +2885,9 @@ class TxnTile extends StatelessWidget {
       case tRepay:
         return 'رد سلفة من ${data.personName(t.personId)}';
       case tToPhone:
-        return 'اتحول للتليفون التاني';
+        return 'اتحول لـ ${data.otherName}';
       case tFromPhone:
-        return 'استلام من التليفون الأساسي';
+        return 'استلام من ${data.otherName}';
     }
     return t.type;
   }
@@ -2236,7 +3029,7 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
 
   String get title {
     if (widget.bill != null) return 'دفع فاتورة ${widget.bill!.name}';
-    final l = kTypeLabels[type] ?? type;
+    final l = type == tToPhone ? 'تحويل لـ ${d.otherName}' : (kTypeLabels[type] ?? type);
     return editing ? 'تعديل $l' : l;
   }
 
@@ -2610,10 +3403,10 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
           label: Text('${arabicWeekdays[date.weekday - 1]} ${arDate(date)}'),
         ),
         const SizedBox(height: 14),
-        // «من التليفون الأساسي» دايمًا موجود كاختيار (لو التحويل اتسجل بإيد من غير ملف)
+        // «من التليفون التاني» دايمًا موجود كاختيار (لو التحويل اتسجل بإيد من غير ملف)
         if (type == tAdd)
           noteSuggestions([
-            ...d.sources.where((x) => !sameLabel(x, kFromMainSource)),
+            ...d.sources.where((x) => !isPhoneSource(x)),
             kFromMainSource,
           ]),
         if (type == tWithdraw) noteSuggestions(d.reasons),
@@ -2625,10 +3418,10 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
                 color: C.blue.withValues(alpha: 0.10),
                 borderRadius: BorderRadius.circular(14),
                 border: Border.all(color: C.blue.withValues(alpha: 0.4))),
-            child: const Text(
-                'الفلوس دي بتتخصم من المكان هنا، ومش بتتحسب صرف. بعد ما تسجّل هتبعت ملف صغير على واتساب للتليفون التاني، '
-                'وهو يدوس «استلم تحويل من الأساسي» فتدخل عنده.',
-                style: TextStyle(fontSize: 12.5)),
+            child: Text(
+                'الفلوس دي بتتخصم من المكان هنا، ومش بتتحسب صرف. بعد ما تسجّل هتبعت ملف صغير على واتساب لـ ${d.otherName}، '
+                'وهو يدوس «تحديث» (أو «استلم تحويل») فتدخل عنده.',
+                style: const TextStyle(fontSize: 12.5)),
           ),
         ],
         TextField(
@@ -2719,7 +3512,8 @@ class SetupScreen extends StatefulWidget {
 }
 
 class _SetupScreenState extends State<SetupScreen> {
-  String role = 'main';
+  String role = 'main'; // داخلي بس (للتوافق مع النسخ القديمة)
+  String? nameErr;
   final nameCtl = TextEditingController();
   List<FoundFile>? backups;
 
@@ -2733,6 +3527,18 @@ class _SetupScreenState extends State<SetupScreen> {
         if (mounted && b.isNotEmpty) setState(() => backups = b);
       }
     }();
+  }
+
+  MoneyData? newData() {
+    final n = cleanLabel(nameCtl.text);
+    if (n.isEmpty) {
+      setState(() => nameErr = 'اكتب اسم للتليفون الأول');
+      return null;
+    }
+    final d = MoneyData.fresh();
+    d.role = role;
+    d.phoneName = n;
+    return d;
   }
 
   Future<void> findBackups() async {
@@ -2750,59 +3556,49 @@ class _SetupScreenState extends State<SetupScreen> {
           const SizedBox(height: 10),
           const BrandHeader(),
           const SizedBox(height: 22),
-          const Text('أهلاً! التليفون ده إيه؟', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+          const Text('أهلاً! سمّي التليفون ده', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
           const SizedBox(height: 6),
-          const Text('كل تليفون ليه أرصدته لوحده. آخر الشهر التليفون التاني بيبعت ملف للأساسي عشان يطلع إجمالي الصرف.',
+          const Text('كل تليفون ليه أرصدته لوحده، والتليفونين بيبعتوا نسخهم لبعض في أي وقت عشان يطلع إجمالي الصرف. '
+              'الاسم ده هو اللي هيظهر على التليفون التاني.',
               style: TextStyle(color: C.muted)),
-          const SizedBox(height: 14),
-          for (final r in const [
-            ['main', 'التليفون الأساسي', 'بيستلم ملف التليفون التاني ويطلع الإجمالي'],
-            ['second', 'التليفون التاني', 'آخر الشهر بيبعت ملف الشهر للأساسي'],
-          ])
-            Padding(
-              padding: const EdgeInsets.only(bottom: 10),
-              child: InkWell(
-                borderRadius: BorderRadius.circular(18),
-                onTap: () => setState(() => role = r[0]),
-                child: Container(
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                      color: role == r[0] ? C.gold.withValues(alpha: 0.14) : C.card,
-                      borderRadius: BorderRadius.circular(18),
-                      border: Border.all(color: role == r[0] ? C.gold : C.line, width: 1.5)),
-                  child: Row(children: [
-                    Icon(r[0] == 'main' ? Icons.phone_android_rounded : Icons.mobile_screen_share_rounded,
-                        color: role == r[0] ? C.gold : C.muted, size: 30),
-                    const SizedBox(width: 12),
-                    Expanded(
-                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text(r[1], style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16)),
-                      Text(r[2], style: const TextStyle(color: C.muted, fontSize: 12.5)),
-                    ])),
-                    if (role == r[0]) const Icon(Icons.check_circle_rounded, color: C.gold),
-                  ]),
-                ),
-              ),
-            ),
+          const SizedBox(height: 8),
           const SizedBox(height: 6),
           TextField(
             controller: nameCtl,
-            decoration: const InputDecoration(labelText: 'اسم التليفون (اختياري) — مثلاً: تليفون أحمد'),
+            decoration: InputDecoration(labelText: 'اسم التليفون — مثلاً: تليفون أحمد', errorText: nameErr),
+            onChanged: (_) {
+              if (nameErr != null) setState(() => nameErr = null);
+            },
           ),
           const SizedBox(height: 18),
           FilledButton.icon(
             style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16)),
             onPressed: () async {
-              final d = MoneyData.fresh();
-              d.role = role;
-              d.phoneName = nameCtl.text.trim().isEmpty
-                  ? (role == 'main' ? 'التليفون الأساسي' : 'التليفون التاني')
-                  : nameCtl.text.trim();
-              await widget.onDone(d);
+              final d = newData();
+              if (d != null) await widget.onDone(d);
             },
             icon: const Icon(Icons.rocket_launch_rounded),
             label: const Text('ابدأ (فاضي)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w800)),
           ),
+          ...[
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
+              onPressed: () async {
+                final d = newData();
+                if (d == null) return;
+                final changed = await receiveListsFlow(context, d);
+                if (changed) await widget.onDone(d);
+              },
+              icon: const Icon(Icons.playlist_add_rounded),
+              label: const Text('عندك ملف قوايم من التليفون التاني؟ ابدأ بيه'),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(top: 4),
+              child: Text('اختياري: الأسرة والبنود والفواتير بتيجي جاهزة، والأرصدة بتبدأ صفر.',
+                  style: TextStyle(color: C.muted, fontSize: 12)),
+            ),
+          ],
           const SizedBox(height: 10),
           OutlinedButton.icon(
             style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
@@ -2823,7 +3619,7 @@ class _SetupScreenState extends State<SetupScreen> {
                     final ok = await confirmDialog(context, 'ترجّع النسخة دي؟', b.label, yes: 'رجّعها');
                     if (!ok) return;
                     final d = MoneyData.fromJson(b.json);
-                    if (d.role.isEmpty) d.role = role;
+                    if (d.role.isEmpty) d.role = 'main';
                     await widget.onDone(d);
                   },
                 ),
@@ -2988,7 +3784,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     }
   }
 
-  /// استلام تحويل من الأساسي (على التليفون التاني)
+  /// استلام تحويل من التليفون التاني (بإيدك من أي فولدر)
   Future<void> receiveTransfer() async {
     await getAppFolder(requestPermissions: true);
     final files = await listTransferFiles(d);
@@ -3000,13 +3796,13 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 18, 16, 12),
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            const Text('تحويلات من الأساسي', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+            Text('تحويلات من ${d.otherName}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
             const Text('من واتساب و Download — افتح الملف في الشات مرة الأول عشان يتنزل', style: TextStyle(color: C.muted, fontSize: 12)),
             const SizedBox(height: 10),
             if (files.isEmpty)
               const Padding(
                 padding: EdgeInsets.all(16),
-                child: Text('مفيش ملفات تحويل. خلي التليفون الأساسي يسجّل «تحويل للتليفون التاني» ويبعت الملف على واتساب.',
+                child: Text('مفيش ملفات تحويل. خلي التليفون التاني يسجّل «حوّل فلوس» ويبعت الملف على واتساب.',
                     style: TextStyle(color: C.muted)),
               ),
             Flexible(
@@ -3018,7 +3814,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                     title: Text(f.label, style: const TextStyle(fontWeight: FontWeight.w700)),
                     subtitle: Text(
                         [
-                          'من ${f.json['fromPhoneName'] ?? 'الأساسي'}',
+                          'من ${f.json['fromPhoneName'] ?? d.otherName}',
                           if ('${f.json['note'] ?? ''}'.trim().isNotEmpty) '${f.json['note']}',
                         ].join(' • '),
                         style: const TextStyle(color: C.muted, fontSize: 12)),
@@ -3041,6 +3837,146 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     final r = d.importTransferJson(pick.json, placeId);
     if (r.ok) await persist();
     if (mounted) toast(context, r.message, bad: !r.ok);
+  }
+
+  /// البادج اللي فوق ← تغيير اسم التليفون
+  Future<void> phoneSheet() async {
+    final n = await askText(context, 'اسم التليفون ده', initial: d.phoneName, hint: 'مثلاً: تليفون أحمد');
+    if (n == null) return;
+    d.phoneName = n;
+    await persist();
+  }
+
+  /// «ابعت نسختي»: الشهر ده أو كل الشهور + القوايم ← واتساب
+  Future<void> sendCopy() async {
+    final scope = await showModalBottomSheet<String>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 18, 16, 12),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Text('ابعت نسختي لـ ${d.otherName}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+            const Text('عملياتك + القوايم. التليفون التاني بيبدّل نسختك القديمة بالجديدة — مفيش تكرار، وأرصدته مابتتلمسش.',
+                style: TextStyle(color: C.muted, fontSize: 12.5)),
+            const SizedBox(height: 12),
+            ListTile(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: C.line)),
+              leading: const Icon(Icons.all_inclusive_rounded, color: C.gold),
+              title: const Text('كل الشهور (أحسن)'),
+              onTap: () => Navigator.pop(c, 'all'),
+            ),
+            const SizedBox(height: 8),
+            ListTile(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: C.line)),
+              leading: const Icon(Icons.calendar_month_rounded, color: C.emerald),
+              title: Text('${monthLabel(month)} بس'),
+              onTap: () => Navigator.pop(c, month),
+            ),
+          ]),
+        ),
+      ),
+    );
+    if (scope == null || !mounted) return;
+    try {
+      Directory out;
+      try {
+        final dir = await getAppFolder();
+        out = Directory('${dir.path}/Copies');
+        if (!await out.exists()) await out.create(recursive: true);
+      } catch (_) {
+        out = await getTemporaryDirectory();
+      }
+      final now = DateTime.now();
+      final f = File('${out.path}/$kCopyFilePrefix${isoDate(now)}_${two(now.hour)}${two(now.minute)}${two(now.second)}.json');
+      await f.writeAsString(jsonEncode(d.exportCopy(month: scope == 'all' ? null : scope)), flush: true);
+      await Share.shareXFiles([XFile(f.path, mimeType: 'application/json')],
+          text: 'A2R Money — نسخة ${d.badgeName}${scope == 'all' ? '' : ' (${monthLabel(scope)})'}');
+    } catch (e) {
+      if (mounted) toast(context, 'الملف ماتبعتش: $e', bad: true);
+    }
+  }
+
+  /// اختيار فولدر الاستلام (بيتحفظ)
+  Future<bool> chooseSyncFolder() async {
+    await getAppFolder(requestPermissions: true);
+    if (!mounted) return false;
+    final p = await Navigator.push<String>(context, MaterialPageRoute(builder: (_) => FolderPickerScreen(current: d.syncFolder)));
+    if (p == null || p.isEmpty) return false;
+    d.syncFolder = p;
+    await persist();
+    return true;
+  }
+
+  /// «تحديث»: أحدث نسخة من التليفون التاني من الفولدر المحفوظ + القوايم + التحويلات
+  Future<void> syncNow() async {
+    if (d.syncFolder.isEmpty) {
+      final ok = await chooseSyncFolder();
+      if (!ok || !mounted) return;
+    }
+    await getAppFolder(requestPermissions: true);
+    List<Map<String, dynamic>> files;
+    try {
+      if (!await Directory(d.syncFolder).exists()) {
+        if (!mounted) return;
+        final change = await confirmDialog(context, 'الفولدر مش موجود', '${d.syncFolder}\nتختار فولدر تاني؟', yes: 'اختار');
+        if (change) await chooseSyncFolder();
+        return;
+      }
+      files = await readSyncFolder(d.syncFolder);
+    } catch (e) {
+      if (mounted) toast(context, 'مقدرتش أقرا الفولدر: $e', bad: true);
+      return;
+    }
+    final plan = d.planSync(files);
+    if (!mounted) return;
+    if (plan.isEmpty) {
+      toast(context, 'مفيش نسخة أحدث من ${d.otherName}');
+      return;
+    }
+    final msgs = <String>[];
+    var changed = false;
+    String latestName = '', latestAt = '';
+    for (final j in [...plan.copies, ...plan.months]) {
+      final r = d.importCopyJson(j);
+      if (r.ok) {
+        changed = true;
+        if (r.exportedAt.compareTo(latestAt) > 0) {
+          latestAt = r.exportedAt;
+          latestName = r.fromName;
+        }
+      }
+    }
+    if (latestAt.isNotEmpty) {
+      final w = DateTime.tryParse(latestAt)?.toLocal();
+      msgs.add('اتحدث — آخر نسخة من $latestName ${w == null ? '' : '${arDateShort(isoDate(w))} ${two(w.hour)}:${two(w.minute)}'}');
+    }
+    var listsAdded = 0;
+    for (final j in plan.lists) {
+      final r = d.mergeListsJson(j, addPlaces: false);
+      if (r.ok && r.total > 0) {
+        listsAdded += r.total;
+        changed = true;
+      }
+    }
+    if (listsAdded > 0) msgs.add('اتضاف $listsAdded من القوايم');
+    if (changed) await persist();
+    if (!mounted) return;
+    // التحويلات: كل واحد بيختار المكان اللي هيدخله (ولو اتلغى يفضل للمرة الجاية)
+    var trDone = 0;
+    for (final j in plan.transfers) {
+      if (!mounted) return;
+      final amt = (j['amount'] as num?)?.toInt() ?? 0;
+      final pid = await pickPlace(context, d, title: 'تحويل ${egp(amt)} من ${j['fromPhoneName'] ?? d.otherName} — هيدخل فين؟');
+      if (pid == null) continue;
+      final r = d.importTransferJson(j, pid);
+      if (r.ok) {
+        trDone++;
+        await persist();
+      }
+    }
+    if (trDone > 0) msgs.add('اتسجل $trDone تحويل');
+    if (plan.transfers.length > trDone) msgs.add('${plan.transfers.length - trDone} تحويل لسه مستني (دوس تحديث تاني)');
+    if (mounted) toast(context, msgs.isEmpty ? 'مفيش نسخة أحدث من ${d.otherName}' : msgs.join(' • '));
   }
 
   /// «ابدأ بأرصدتك»: كل الأماكن في شاشة واحدة
@@ -3081,7 +4017,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
               crossAxisSpacing: 10,
               physics: const NeverScrollableScrollPhysics(),
               children: [
-                for (final t in [tExpense, tWithdraw, tAdd, tTransfer, tAdvance, tRepay, d.isMain ? tToPhone : tFromPhone])
+                for (final t in [tExpense, tWithdraw, tAdd, tTransfer, tAdvance, tRepay, tToPhone, tFromPhone])
                   InkWell(
                     borderRadius: BorderRadius.circular(18),
                     onTap: () {
@@ -3100,7 +4036,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                       child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
                         Icon(typeIcon(t), color: typeColor(t), size: 30),
                         const SizedBox(height: 6),
-                        Text(t == tToPhone ? 'للتليفون التاني' : t == tFromPhone ? 'استلم تحويل' : kTypeLabels[t]!,
+                        Text(t == tToPhone ? 'حوّل لـ ${d.otherName}' : t == tFromPhone ? 'استلم تحويل' : kTypeLabels[t]!, maxLines: 2, overflow: TextOverflow.ellipsis,
                             textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w800)),
                       ]),
                     ),
@@ -3128,7 +4064,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
         titleSpacing: 16,
         title: const BrandHeader(small: true),
         actions: [
-          Center(child: Pill(d.isMain ? 'الأساسي' : 'التليفون التاني', color: d.isMain ? C.gold : C.emerald)),
+          Center(child: PhoneBadge(data: d, onTap: phoneSheet)),
           IconButton(
             tooltip: 'الإعدادات',
             icon: const Icon(Icons.tune_rounded),
@@ -3276,15 +4212,33 @@ class HomeTab extends StatelessWidget {
           ),
       ]),
       const SizedBox(height: 10),
+      Row(children: [
+        Expanded(
+          child: FilledButton.icon(
+            style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
+            onPressed: shell.syncNow,
+            icon: const Icon(Icons.sync_rounded),
+            label: const Text('تحديث', style: TextStyle(fontWeight: FontWeight.w800)),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: OutlinedButton.icon(
+            style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
+            onPressed: shell.sendCopy,
+            icon: const Icon(Icons.ios_share_rounded),
+            label: Text('ابعت نسختي لـ ${d.otherName}', maxLines: 1, overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontWeight: FontWeight.w700)),
+          ),
+        ),
+      ]),
+      const SizedBox(height: 8),
       OutlinedButton.icon(
         style: OutlinedButton.styleFrom(
-            padding: const EdgeInsets.symmetric(vertical: 13),
-            side: BorderSide(color: (d.isMain ? C.blue : C.emerald).withValues(alpha: 0.7))),
-        onPressed: d.isMain ? () => shell.openForm(tToPhone) : shell.receiveTransfer,
-        icon: Icon(d.isMain ? Icons.send_to_mobile_rounded : Icons.install_mobile_rounded,
-            color: d.isMain ? C.blue : C.emerald),
-        label: Text(d.isMain ? 'حوّل للتليفون التاني' : 'استلم تحويل من الأساسي',
-            style: const TextStyle(fontWeight: FontWeight.w800)),
+            padding: const EdgeInsets.symmetric(vertical: 12), side: BorderSide(color: C.blue.withValues(alpha: 0.7))),
+        onPressed: () => shell.openForm(tToPhone),
+        icon: const Icon(Icons.send_to_mobile_rounded, color: C.blue),
+        label: Text('حوّل فلوس لـ ${d.otherName}', style: const TextStyle(fontWeight: FontWeight.w800)),
       ),
       if (due.isNotEmpty) ...[
         const SectionTitle('فواتير لازم تتدفع'),
@@ -3942,29 +4896,6 @@ class _MonthTabState extends State<MonthTab> {
     }
   }
 
-  Future<void> sendMonth() async {
-    setState(() => busy = true);
-    try {
-      final j = d.exportMonth(sh.month);
-      Directory out;
-      try {
-        final dir = await getAppFolder();
-        out = Directory('${dir.path}/Months');
-        if (!await out.exists()) await out.create(recursive: true);
-      } catch (_) {
-        out = await getTemporaryDirectory();
-      }
-      final f = File('${out.path}/$kMonthFilePrefix${sh.month}_${d.phoneId.substring(d.phoneId.length - 6)}.json');
-      await f.writeAsString(jsonEncode(j), flush: true);
-      await Share.shareXFiles([XFile(f.path, mimeType: 'application/json')],
-          text: 'A2R Money — ${monthLabel(sh.month)} من ${d.phoneName}');
-    } catch (e) {
-      if (mounted) toast(context, 'الملف ماتبعتش: $e', bad: true);
-    } finally {
-      if (mounted) setState(() => busy = false);
-    }
-  }
-
   Future<void> receiveMonth() async {
     setState(() => busy = true);
     await getAppFolder(requestPermissions: true);
@@ -3978,13 +4909,13 @@ class _MonthTabState extends State<MonthTab> {
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 18, 16, 12),
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-            const Text('ملفات الشهر اللي لقيناها', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+            const Text('نسخ التليفون التاني اللي لقيناها', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
             const Text('من واتساب و Download — نزّل الملف من الشات الأول', style: TextStyle(color: C.muted, fontSize: 12)),
             const SizedBox(height: 10),
             if (files.isEmpty)
               const Padding(
                 padding: EdgeInsets.all(16),
-                child: Text('مفيش ملفات. خلي التليفون التاني يدوس «ابعت ملف الشهر» ويبعته على واتساب، '
+                child: Text('مفيش ملفات. خلي التليفون التاني يدوس «ابعت نسختي» ويبعتها على واتساب، '
                     'وانت افتح الملف في الشات مرة (عشان يتنزل) وارجع هنا.',
                     style: TextStyle(color: C.muted)),
               ),
@@ -4006,19 +4937,38 @@ class _MonthTabState extends State<MonthTab> {
     );
     if (pick == null) return;
     final key = '${pick.json['phoneId']}|${pick.json['month']}';
-    final old = d.imported[key];
+    final old = pick.json['type'] == 'month' ? d.imported[key] : null;
     if (old != null && mounted) {
       final ok = await confirmDialog(context, 'الشهر ده متضاف قبل كده',
           'هيتبدل القديم (${old.txns.length} عملية) بالجديد — مفيش تكرار. تكمل؟', yes: 'بدّله');
       if (!ok) return;
     }
-    final r = d.importMonthJson(pick.json);
+    final r = d.importCopyJson(pick.json);
     if (r.ok) {
-      if (r.month != null) sh.setMonth(r.month!.month);
+      if (pick.json['type'] == 'month') sh.setMonth('${pick.json['month']}');
       await sh.persist();
     }
     if (mounted) toast(context, r.message, bad: !r.ok);
   }
+
+  Widget _trRow(IconData ic, String label, int v, Color c) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 3),
+        child: Row(children: [
+          Icon(ic, color: c, size: 20),
+          const SizedBox(width: 8),
+          Expanded(child: Text(label, style: const TextStyle(fontWeight: FontWeight.w700))),
+          Text(egp(v), style: TextStyle(fontWeight: FontWeight.w900, color: c)),
+        ]),
+      );
+
+  Widget _trWarn(String m) => Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 2),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Icon(Icons.warning_amber_rounded, color: C.red, size: 18),
+          const SizedBox(width: 6),
+          Expanded(child: Text(m, style: const TextStyle(color: C.red, fontSize: 12))),
+        ]),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -4052,7 +5002,7 @@ class _MonthTabState extends State<MonthTab> {
         ]),
       ),
       const SectionTitle('حسب التليفون'),
-      _phoneRow(d.phoneName.isEmpty ? 'التليفون ده' : '${d.phoneName} (ده)', own, C.gold),
+      _phoneRow('${d.badgeName} (ده)', own, C.gold),
       for (final m in imports)
         _phoneRow('${m.phoneName} • استلمته ${arDateShort(m.exportedAt.length >= 10 ? m.exportedAt.substring(0, 10) : isoDate(DateTime.now()))}',
             d.importedSummary(m), C.emerald,
@@ -4063,35 +5013,41 @@ class _MonthTabState extends State<MonthTab> {
               d.imported.remove(m.key);
               await sh.persist();
             }),
-      if (d.isMain)
-        Padding(
-          padding: const EdgeInsets.only(top: 6),
-          child: OutlinedButton.icon(
-            onPressed: busy ? null : receiveMonth,
-            icon: const Icon(Icons.download_rounded),
-            label: const Text('استلم ملف الشهر من التليفون التاني'),
+      Padding(
+        padding: const EdgeInsets.only(top: 6),
+        child: Row(children: [
+          Expanded(
+            child: FilledButton.icon(
+              style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
+              onPressed: busy ? null : sh.syncNow,
+              icon: const Icon(Icons.sync_rounded),
+              label: const Text('تحديث', style: TextStyle(fontWeight: FontWeight.w800)),
+            ),
           ),
-        )
-      else ...[
-        Padding(
-          padding: const EdgeInsets.only(top: 6),
-          child: FilledButton.icon(
-            style: FilledButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 14)),
-            onPressed: busy ? null : sendMonth,
-            icon: const Icon(Icons.send_rounded),
-            label: Text('ابعت ملف ${monthLabel(mk)} للتليفون الأساسي'),
+          const SizedBox(width: 8),
+          Expanded(
+            child: OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 13)),
+              onPressed: busy ? null : sh.sendCopy,
+              icon: const Icon(Icons.ios_share_rounded),
+              label: Text('ابعت نسختي لـ ${d.otherName}', maxLines: 1, overflow: TextOverflow.ellipsis),
+            ),
           ),
+        ]),
+      ),
+      Wrap(alignment: WrapAlignment.center, children: [
+        TextButton.icon(
+          onPressed: busy ? null : receiveMonth,
+          icon: const Icon(Icons.download_rounded, size: 18),
+          label: const Text('استلم ملف بإيدك'),
         ),
-        Padding(
-          padding: const EdgeInsets.only(top: 8),
-          child: OutlinedButton.icon(
-            onPressed: busy ? null : sh.receiveTransfer,
-            icon: const Icon(Icons.install_mobile_rounded, color: C.emerald),
-            label: const Text('استلم تحويل من الأساسي'),
-          ),
+        TextButton.icon(
+          onPressed: busy ? null : sh.receiveTransfer,
+          icon: const Icon(Icons.install_mobile_rounded, size: 18, color: C.emerald),
+          label: const Text('استلم تحويل'),
         ),
-      ],
-      if (d.isMain && (tc.sent > 0 || tc.received > 0))
+      ]),
+      if (tc.sent > 0 || tc.received > 0 || tc.otherSent > 0 || tc.ownReceived > 0)
         Padding(
           padding: const EdgeInsets.only(top: 10),
           child: Container(
@@ -4099,39 +5055,24 @@ class _MonthTabState extends State<MonthTab> {
             decoration: BoxDecoration(
               color: C.card,
               borderRadius: BorderRadius.circular(18),
-              border: Border.all(color: (tc.hasOther && tc.sent != tc.received ? C.red : C.blue).withValues(alpha: 0.6)),
+              border: Border.all(color: (tc.hasOther && (tc.sent != tc.received || tc.otherSent != tc.ownReceived) ? C.red : C.blue).withValues(alpha: 0.6)),
             ),
             child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-              Row(children: [
-                const Icon(Icons.send_to_mobile_rounded, color: C.blue, size: 20),
-                const SizedBox(width: 8),
-                const Expanded(child: Text('اتحول للتليفون التاني', style: TextStyle(fontWeight: FontWeight.w700))),
-                Text(egp(tc.sent), style: const TextStyle(fontWeight: FontWeight.w900, color: C.blue)),
-              ]),
-              if (tc.hasOther) ...[
-                const SizedBox(height: 6),
-                Row(children: [
-                  const Icon(Icons.install_mobile_rounded, color: C.emerald, size: 20),
-                  const SizedBox(width: 8),
-                  const Expanded(child: Text('التليفون التاني استلم', style: TextStyle(fontWeight: FontWeight.w700))),
-                  Text(egp(tc.received), style: const TextStyle(fontWeight: FontWeight.w900, color: C.emerald)),
-                ]),
-                if (tc.sent != tc.received)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 6),
-                    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      const Icon(Icons.warning_amber_rounded, color: C.red, size: 18),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        child: Text('مش زي بعض — فرق ${egp((tc.sent - tc.received).abs())}. '
-                            'غالباً في تحويل لسه ماتسجلش على التليفون التاني (أو اتسجل في شهر تاني).',
-                            style: const TextStyle(color: C.red, fontSize: 12)),
-                      ),
-                    ]),
-                  ),
+              if (tc.sent > 0 || tc.received > 0) ...[
+                _trRow(Icons.send_to_mobile_rounded, 'انا حوّلت لـ ${d.otherName}', tc.sent, C.blue),
+                if (tc.hasOther) _trRow(Icons.install_mobile_rounded, '${d.otherName} استلم', tc.received, C.emerald),
+                if (tc.hasOther && tc.sent != tc.received)
+                  _trWarn('فرق ${egp((tc.sent - tc.received).abs())} — غالباً في تحويل لسه ماتسجلش عند ${d.otherName} (أو اتسجل في شهر تاني).'),
+              ],
+              if (tc.otherSent > 0 || tc.ownReceived > 0) ...[
+                if (tc.sent > 0 || tc.received > 0) const Divider(height: 14),
+                if (tc.hasOther) _trRow(Icons.send_to_mobile_rounded, '${d.otherName} حوّل ليّا', tc.otherSent, C.blue),
+                _trRow(Icons.install_mobile_rounded, 'انا استلمت', tc.ownReceived, C.emerald),
+                if (tc.hasOther && tc.otherSent != tc.ownReceived)
+                  _trWarn('فرق ${egp((tc.otherSent - tc.ownReceived).abs())} — دوس «تحديث» أو «استلم تحويل» عشان تسجّل اللي ناقص.'),
               ],
               const SizedBox(height: 6),
-              const Text('التحويلات دي مش بتتحسب صرف — صرف التليفون التاني بيتحسب مرة واحدة من ملف الشهر بتاعه.',
+              const Text('التحويلات دي مش بتتحسب صرف — صرف كل تليفون بيتحسب مرة واحدة من نسخته.',
                   style: TextStyle(color: C.muted, fontSize: 11.5)),
             ]),
           ),
@@ -4174,9 +5115,9 @@ class _MonthTabState extends State<MonthTab> {
           ListTile(dense: true, title: const Text('سلف رجعت'), trailing: Text(egp(all.advancesBack), style: const TextStyle(color: C.emerald, fontWeight: FontWeight.w800))),
           ListTile(dense: true, title: const Text('تحويلات بين الأماكن (مش صرف)'), trailing: Text(egp(all.transfers), style: const TextStyle(color: C.blue, fontWeight: FontWeight.w800))),
           if (own.toPhone > 0)
-            ListTile(dense: true, title: const Text('اتحول للتليفون التاني (مش صرف)'), trailing: Text(egp(own.toPhone), style: const TextStyle(color: C.blue, fontWeight: FontWeight.w800))),
+            ListTile(dense: true, title: Text('اتحول لـ ${d.otherName} (مش صرف)'), trailing: Text(egp(own.toPhone), style: const TextStyle(color: C.blue, fontWeight: FontWeight.w800))),
           if (own.fromPhone > 0)
-            ListTile(dense: true, title: const Text('اتاستلم من الأساسي (مش صرف)'), trailing: Text(egp(own.fromPhone), style: const TextStyle(color: C.emerald, fontWeight: FontWeight.w800))),
+            ListTile(dense: true, title: Text('اتاستلم من ${d.otherName} (مش صرف)'), trailing: Text(egp(own.fromPhone), style: const TextStyle(color: C.emerald, fontWeight: FontWeight.w800))),
         ]),
       ),
       const SizedBox(height: 16),
@@ -4644,6 +5585,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
               maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: C.muted, fontSize: 12)),
           onTap: () => manageList('أسماء الفواتير', d.billNames, 'اسم فاتورة جديد'),
         ),
+        const SectionTitle('القوايم بين التليفونين'),
+        const Text('ابعت الأسرة والبنود والفواتير والأماكن لتليفون تاني بدل ما تكتبهم من جديد. '
+            'من غير أي فلوس: لا أرصدة ولا عمليات ولا سلف.',
+            style: TextStyle(color: C.muted, fontSize: 12)),
+        const SizedBox(height: 8),
+        FilledButton.tonalIcon(
+          onPressed: () => sendListsFile(context, d),
+          icon: const Icon(Icons.ios_share_rounded),
+          label: const Text('ابعت القوايم لتليفون تاني'),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          onPressed: () async {
+            final changed = await receiveListsFlow(context, d);
+            if (changed) await save();
+          },
+          icon: const Icon(Icons.playlist_add_rounded),
+          label: const Text('استلم القوايم من تليفون تاني'),
+        ),
         const SectionTitle('التليفون ده'),
         ListTile(
           leading: const Icon(Icons.badge_rounded, color: C.emerald),
@@ -4656,15 +5616,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
             await save();
           },
         ),
-        SwitchListTile(
-          secondary: const Icon(Icons.phone_android_rounded, color: C.gold),
-          title: const Text('ده التليفون الأساسي'),
-          subtitle: Text(d.isMain ? 'بيستلم ملف التليفون التاني' : 'تليفون تاني: بيبعت ملف الشهر للأساسي',
+        ListTile(
+          leading: const Icon(Icons.folder_special_rounded, color: C.gold),
+          title: const Text('فولدر الاستلام (للتحديث)'),
+          subtitle: Text(d.syncFolder.isEmpty ? 'لسه ماتحددش — هيتسأل أول مرة تدوس «تحديث»' : d.syncFolder,
               style: const TextStyle(color: C.muted, fontSize: 12)),
-          value: d.isMain,
-          onChanged: (v) async {
-            d.role = v ? 'main' : 'second';
-            await save();
+          onTap: () async {
+            await widget.shell.chooseSyncFolder();
+            if (mounted) setState(() {});
           },
         ),
         const SectionTitle('النسخ الاحتياطي'),
