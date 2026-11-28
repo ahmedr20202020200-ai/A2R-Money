@@ -384,6 +384,21 @@ class Bill {
   }
 }
 
+/// صنف جوه مصروف («تفاصيل الصرف»): اسم + مبلغ اختياري (بالقروش، null = من غير مبلغ)
+class TxnItem {
+  String name;
+  int? amount;
+  TxnItem({required this.name, this.amount});
+  Map<String, dynamic> toJson() => {'n': name, if (amount != null) 'a': amount};
+  static TxnItem? fromJson(dynamic j) {
+    if (j is! Map) return null;
+    final n = cleanLabel('${j['n'] ?? j['name'] ?? ''}');
+    if (n.isEmpty) return null;
+    final a = (j['a'] ?? j['amount']) as num?;
+    return TxnItem(name: n, amount: a == null ? null : a.toInt().abs());
+  }
+}
+
 class Txn {
   String id;
   String type;
@@ -399,6 +414,7 @@ class Txn {
   String note; // السبب/المصدر (اختياري)
   String refId; // استلام تحويل: رقم التحويل اللي جه من الأساسي (عشان مايتسجلش مرتين)
   String createdAt;
+  List<TxnItem> items; // «تفاصيل الصرف» (اختياري)
   Txn({
     required this.id,
     required this.type,
@@ -414,7 +430,9 @@ class Txn {
     this.note = '',
     this.refId = '',
     String? createdAt,
-  }) : createdAt = createdAt ?? DateTime.now().toIso8601String();
+    List<TxnItem>? items,
+  })  : createdAt = createdAt ?? DateTime.now().toIso8601String(),
+        items = items ?? [];
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -431,6 +449,7 @@ class Txn {
         if (note.isNotEmpty) 'note': note,
         if (refId.isNotEmpty) 'refId': refId,
         'createdAt': createdAt,
+        if (items.isNotEmpty) 'items': items.map((e) => e.toJson()).toList(),
       };
   factory Txn.fromJson(Map<String, dynamic> j) => Txn(
         id: '${j['id']}',
@@ -447,11 +466,34 @@ class Txn {
         note: '${j['note'] ?? ''}',
         refId: '${j['refId'] ?? ''}',
         createdAt: '${j['createdAt'] ?? ''}',
+        items: (j['items'] is List)
+            ? (j['items'] as List).map(TxnItem.fromJson).whereType<TxnItem>().toList()
+            : null,
       );
   Txn copy() => Txn.fromJson(toJson());
 
   /// يدخل في «إجمالي الصرف»: مصروف + فاتورة + سحب
   bool get isSpend => type == tExpense || type == tBill || type == tWithdraw;
+
+  /// مجموع الأصناف اللي ليها مبلغ
+  int get itemsSum => items.fold<int>(0, (s, e) => s + (e.amount ?? 0));
+
+  /// الباقي «من غير تفصيل» (لو الأصناف أقل من المبلغ)
+  int get itemsRemainder => items.isEmpty ? 0 : max(0, amount - itemsSum);
+
+  /// ملخص الأصناف في سطر: «عيش 60 • زيت 180 • رز»
+  String get itemsLine => items.map((e) => e.amount == null ? e.name : '${e.name} ${money(e.amount!)}').join(' • ');
+}
+
+/// نتيجة البحث بالاسم (صنف/ملاحظة/بند)
+class ItemSearch {
+  final List<Txn> txns; // العمليات اللي فيها الاسم ده (الأحدث الأول)
+  final int total; // مجموع مبالغ الأصناف المطابقة
+  final int withAmount; // عدد الأصناف المطابقة اللي ليها مبلغ
+  final int noAmount; // مرات من غير مبلغ (صنف من غير مبلغ، أو ملاحظة/بند من غير تفصيل)
+  final Map<String, List<TxnItem>> matched; // رقم العملية ← الأصناف المطابقة
+  const ItemSearch(this.txns, this.total, this.withAmount, this.noAmount, this.matched);
+  bool get hasItems => withAmount > 0 || matched.values.any((l) => l.isNotEmpty);
 }
 
 /// شهر جاي من التليفون التاني (محفوظ لوحده، مش بيتخلط بأرصدة التليفون ده)
@@ -702,6 +744,7 @@ class MoneyData {
   List<String> sources; // مصادر الفلوس اللي بتدخل (إضافة رصيد)
   List<String> reasons; // أسباب السحب
   List<String> billNames; // أسماء الفواتير اللي اتكتبت قبل كده
+  List<String> itemNames; // أسماء الأصناف («تفاصيل الصرف») اللي اتكتبت قبل كده
   String peerName; // اسم التليفون التاني (من آخر ملف جه منه)
   String syncFolder; // فولدر الاستلام اللي اتحدد مرة واحدة ('' = لسه)
   /// آخر صورة كاملة من كل تليفون تاني (عشان تتفرج عليه): تليفون ← {name, at, data}
@@ -723,12 +766,14 @@ class MoneyData {
     List<String>? sources,
     List<String>? reasons,
     List<String>? billNames,
+    List<String>? itemNames,
     this.peerName = '',
     this.syncFolder = '',
     Map<String, Map<String, dynamic>>? peers,
   })  : peers = peers ?? {},
         sources = sources ?? [],
         reasons = reasons ?? [],
+        itemNames = itemNames ?? [],
         billNames = billNames ?? List<String>.from(kDefaultBillNames),
         places = places ?? [],
         people = people ?? [],
@@ -789,6 +834,7 @@ class MoneyData {
         'sources': sources,
         'reasons': reasons,
         'billNames': billNames,
+        'itemNames': itemNames,
         'peerName': peerName,
         'syncFolder': syncFolder,
         'peers': peers,
@@ -850,6 +896,7 @@ class MoneyData {
       sources: sl('sources'),
       reasons: sl('reasons'),
       billNames: j['billNames'] is List ? sl('billNames') : null,
+      itemNames: sl('itemNames'),
       peerName: '${j['peerName'] ?? ''}',
       syncFolder: '${j['syncFolder'] ?? ''}',
       peers: _peersFrom(j['peers']),
@@ -961,6 +1008,60 @@ class MoneyData {
   String addSource(String raw) => addChoice(sources, raw);
   String addReason(String raw) => addChoice(reasons, raw);
   String addBillName(String raw) => addChoice(billNames, raw);
+  String addItemName(String raw) => addChoice(itemNames, raw);
+
+  /// بيحفظ أسماء أصناف العملية كاختيارات (ويوحّد الاسم مع الموجود: «عيش» = «عيش»)
+  void learnItems(Txn t) {
+    final keep = <TxnItem>[];
+    for (final it in t.items) {
+      final n = addItemName(it.name);
+      if (n.isEmpty) continue;
+      it.name = n;
+      keep.add(it);
+    }
+    t.items = keep;
+  }
+
+  /// بحث بالاسم في الأصناف والملاحظات والبنود. [month] = null ← كل الشهور.
+  /// الإجمالي = مجموع مبالغ الأصناف المطابقة بس. اللي من غير مبلغ بيتعدّ لوحده.
+  ItemSearch searchByName(String q, {String? month}) {
+    final nq = normalizeAr(cleanLabel(q));
+    if (nq.isEmpty) return const ItemSearch([], 0, 0, 0, {});
+    final words = nq.split(' ');
+    bool hit(String s) {
+      final h = normalizeAr(s);
+      return words.every(h.contains);
+    }
+
+    final out = <Txn>[];
+    final matched = <String, List<TxnItem>>{};
+    var total = 0, withAmt = 0, noAmt = 0;
+    for (final t in txns) {
+      if (month != null && !inMonth(t.date, month)) continue;
+      final its = t.items.where((e) => hit(e.name)).toList();
+      final other = hit(t.note) || hit(t.category);
+      if (its.isEmpty && !other) continue;
+      out.add(t);
+      matched[t.id] = its;
+      if (its.isNotEmpty) {
+        for (final e in its) {
+          if (e.amount != null) {
+            total += e.amount!;
+            withAmt++;
+          } else {
+            noAmt++;
+          }
+        }
+      } else if (t.isSpend) {
+        noAmt++;
+      }
+    }
+    out.sort((a, b) {
+      final c = b.date.compareTo(a.date);
+      return c != 0 ? c : b.createdAt.compareTo(a.createdAt);
+    });
+    return ItemSearch(out, total, withAmt, noAmt, matched);
+  }
 
   /// شخص بالاسم: لو موجود (نفس الاسم بعد التنضيف) بيرجّعه، لو لأ بيضيفه
   Person? findOrAddPerson(String raw, {bool family = false, bool child = false}) {
@@ -1258,6 +1359,7 @@ class MoneyData {
         'billNames': List<String>.from(billNames),
         'sources': List<String>.from(sources),
         'reasons': List<String>.from(reasons),
+        'itemNames': List<String>.from(itemNames),
         'places': [
           for (final p in places.where((p) => !p.archived)) {'name': p.name, 'kind': p.kind}
         ],
@@ -1331,6 +1433,7 @@ class MoneyData {
     nOther += addAll(t.billNames, strs(j['billNames']));
     nOther += addAll(t.sources, strs(j['sources']));
     nOther += addAll(t.reasons, strs(j['reasons']));
+    nOther += addAll(t.itemNames, strs(j['itemNames']));
     final missingPlaces = <Map<String, dynamic>>[];
     for (final m in maps('places')) {
       final name = cleanLabel('${m['name'] ?? ''}');
@@ -1782,7 +1885,7 @@ List<int>? buildMonthExcel(MoneyData d, String mk) {
   rows('الملخص', sum);
 
   final ops = <List<Object?>>[
-    ['التليفون', 'التاريخ', 'النوع', 'المبلغ (جنيه)', 'المكان', 'لـ مكان', 'المجموعة', 'البند', 'الشخص', 'ملاحظة'],
+    ['التليفون', 'التاريخ', 'النوع', 'المبلغ (جنيه)', 'المكان', 'لـ مكان', 'المجموعة', 'البند', 'الشخص', 'ملاحظة', 'تفاصيل الصرف'],
   ];
   void addOps(String phone, List<Txn> ts, String Function(String) pl, String Function(String) pe) {
     for (final t in ts) {
@@ -1797,6 +1900,7 @@ List<int>? buildMonthExcel(MoneyData d, String mk) {
         t.category,
         t.personId.isEmpty ? '' : pe(t.personId),
         t.note,
+        t.items.isEmpty ? '' : '${t.itemsLine}${t.itemsRemainder > 0 ? ' • من غير تفصيل ${money(t.itemsRemainder)}' : ''}',
       ]);
     }
   }
@@ -3050,7 +3154,8 @@ class TxnTile extends StatelessWidget {
   final Txn t;
   final VoidCallback? onTap;
   final VoidCallback? onLongPress;
-  const TxnTile({super.key, required this.data, required this.t, this.onTap, this.onLongPress});
+  final List<TxnItem>? hits; // في البحث: الأصناف اللي طابقت
+  const TxnTile({super.key, required this.data, required this.t, this.onTap, this.onLongPress, this.hits});
 
   String title() {
     switch (t.type) {
@@ -3114,7 +3219,25 @@ class TxnTile extends StatelessWidget {
                   Text(title(), style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w800), maxLines: 1, overflow: TextOverflow.ellipsis),
                   const SizedBox(height: 2),
                   Text(sub.join(' • '), style: const TextStyle(fontSize: 12, color: C.muted), maxLines: 1, overflow: TextOverflow.ellipsis),
-                  if (t.note.isNotEmpty) Text(t.note, style: const TextStyle(fontSize: 12, color: C.text), maxLines: 1, overflow: TextOverflow.ellipsis),
+                  if (hits != null && hits!.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        hits!.map((e) => e.amount == null ? '${e.name} (من غير مبلغ)' : '${e.name} ${egp(e.amount!)}').join(' • '),
+                        style: const TextStyle(fontSize: 13, color: C.gold, fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                  if (t.items.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        'الأصناف: ${t.itemsLine}${t.itemsRemainder > 0 ? ' • من غير تفصيل ${money(t.itemsRemainder)}' : ''}',
+                        style: const TextStyle(fontSize: 12, color: C.text),
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  if (t.note.isNotEmpty) Text(t.note, style: const TextStyle(fontSize: 12, color: C.text), maxLines: 4, overflow: TextOverflow.ellipsis),
                 ]),
               ),
               const SizedBox(width: 8),
@@ -3173,7 +3296,22 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
   bool withdrawOnItem = false;
   bool typingCat = false; // «✏️ اكتب بند جديد»
   final catCtl = TextEditingController();
-  String? amountErr, placeErr, toErr, groupErr, catErr, personErr;
+  String? amountErr, placeErr, toErr, groupErr, catErr, personErr, itemsErr;
+  /// «تفاصيل الصرف»: كل صف = اسم + مبلغ اختياري
+  final List<({TextEditingController name, TextEditingController amount})> itemRows = [];
+
+  void addItemRow([String name = '', String amount = '']) {
+    itemRows.add((name: TextEditingController(text: name), amount: TextEditingController(text: amount)));
+  }
+
+  @override
+  void dispose() {
+    for (final r in itemRows) {
+      r.name.dispose();
+      r.amount.dispose();
+    }
+    super.dispose();
+  }
 
   MoneyData get d => widget.data;
   bool get editing => widget.existing != null;
@@ -3194,6 +3332,9 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
       personId = e.personId;
       date = parseIso(e.date);
       withdrawOnItem = type == tWithdraw && e.category.isNotEmpty;
+      for (final it in e.items) {
+        addItemRow(it.name, it.amount == null ? '' : money(it.amount!).replaceAll(',', ''));
+      }
     } else {
       date = DateTime.now();
       // آخر مكان اتستخدم بيتختار لوحده — بس بيبان واضح وتقدر تغيره
@@ -3235,6 +3376,25 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
   }
 
   bool get usesCategory => type == tExpense || (type == tWithdraw && withdrawOnItem);
+  bool get itemsAllowed => type == tExpense || type == tBill || (type == tWithdraw && withdrawOnItem);
+
+  /// الأصناف المكتوبة (الصفوف الفاضية بتتشال). null = في مبلغ مكتوب غلط.
+  List<TxnItem>? readItems() {
+    final out = <TxnItem>[];
+    for (final r in itemRows) {
+      final n = cleanLabel(r.name.text);
+      final at = r.amount.text.trim();
+      if (n.isEmpty && at.isEmpty) continue;
+      int? a;
+      if (at.isNotEmpty) {
+        a = parseMoney(at);
+        if (a == null) return null;
+      }
+      if (n.isEmpty) return null;
+      out.add(TxnItem(name: n, amount: (a == null || a == 0) ? null : a));
+    }
+    return out;
+  }
 
   Future<void> save() async {
     final amt = parseMoney(amountCtl.text);
@@ -3253,7 +3413,9 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
           : null;
       personErr = (type == tAdvance || type == tRepay) && personId.isEmpty ? 'اختار الشخص' : null;
     });
-    if ([amountErr, placeErr, toErr, groupErr, catErr, personErr].any((e) => e != null)) return;
+    final items = itemsAllowed ? readItems() : <TxnItem>[];
+    setState(() => itemsErr = items == null ? 'في صنف ناقص اسمه أو مبلغه مكتوب غلط' : null);
+    if ([amountErr, placeErr, toErr, groupErr, catErr, personErr, itemsErr].any((e) => e != null)) return;
     final t = Txn(
       id: widget.existing?.id ?? newId('tx'),
       type: type,
@@ -3271,7 +3433,16 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
       note: noteCtl.text.trim(),
       refId: widget.existing?.refId ?? '',
       createdAt: widget.existing?.createdAt,
+      items: items,
     );
+    // تحذير بس (مش منع) لو الأصناف أكبر من المبلغ
+    if (t.itemsSum > t.amount) {
+      final go = await confirmDialog(context, 'الأصناف أكبر من المبلغ',
+          'مجموع الأصناف: ${egp(t.itemsSum)}\nالمبلغ: ${egp(t.amount)}\n\nتسجّل برضه؟',
+          yes: 'سجّل برضه', no: 'ارجع');
+      if (!go) return;
+      if (!mounted) return;
+    }
     // تحذير بس (مش منع) لو مكان هيبقى بالسالب
     final warn = d.negativeWarnings(t, replacingId: widget.existing?.id);
     if (warn.isNotEmpty) {
@@ -3296,6 +3467,7 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
     }
     if (t.note.isNotEmpty && t.type == tAdd) d.addSource(t.note);
     if (t.note.isNotEmpty && t.type == tWithdraw) d.addReason(t.note);
+    d.learnItems(t);
     Navigator.pop(context, TxnFormResult(saved: t));
   }
 
@@ -3449,6 +3621,105 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
     setState(() => personId = r);
   }
 
+  /// «تفاصيل الصرف» (اختياري): أصناف بأسمائها ومبالغها
+  Widget itemsSection() {
+    final amt = parseMoney(amountCtl.text) ?? 0;
+    var sum = 0, n = 0;
+    for (final r in itemRows) {
+      if (cleanLabel(r.name.text).isEmpty) continue;
+      n++;
+      sum += parseMoney(r.amount.text) ?? 0;
+    }
+    final used = itemRows.map((r) => normalizeAr(cleanLabel(r.name.text))).toSet();
+    final sugg = d.itemNames.reversed.where((x) => !used.contains(normalizeAr(x))).take(16).toList();
+    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+      const SectionTitle('تفاصيل الصرف (اختياري)'),
+      const Text('اكتب الأصناف اللي اتصرفت (عيش، زيت…) — المبلغ لكل صنف اختياري. تقدر تدوّر عليها بعدين من «العمليات».',
+          style: TextStyle(color: C.muted, fontSize: 12)),
+      const SizedBox(height: 8),
+      for (var i = 0; i < itemRows.length; i++)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 8),
+          child: Row(children: [
+            Expanded(
+              flex: 3,
+              child: TextField(
+                controller: itemRows[i].name,
+                textInputAction: TextInputAction.next,
+                onChanged: (_) => setState(() => itemsErr = null),
+                decoration: InputDecoration(labelText: 'الصنف ${i + 1}', hintText: 'مثلاً: عيش', isDense: true),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              flex: 2,
+              child: TextField(
+                controller: itemRows[i].amount,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9٠-٩۰-۹.,٫،]'))],
+                onChanged: (_) => setState(() => itemsErr = null),
+                decoration: const InputDecoration(labelText: 'المبلغ', hintText: 'اختياري', isDense: true),
+              ),
+            ),
+            IconButton(
+              tooltip: 'شيل الصنف',
+              icon: const Icon(Icons.close_rounded, color: C.muted),
+              onPressed: () => setState(() {
+                final r = itemRows.removeAt(i);
+                r.name.dispose();
+                r.amount.dispose();
+              }),
+            ),
+          ]),
+        ),
+      if (sugg.isNotEmpty)
+        Padding(
+          padding: const EdgeInsets.only(bottom: 6),
+          child: Wrap(spacing: 6, runSpacing: 6, children: [
+            for (final x in sugg)
+              ActionChip(
+                avatar: const Icon(Icons.add_rounded, size: 16, color: C.gold),
+                label: Text(x),
+                onPressed: () => setState(() {
+                  // لو في صف فاضي يتملي هو، لو لأ صف جديد
+                  final empty = itemRows.where((r) => r.name.text.trim().isEmpty).toList();
+                  if (empty.isNotEmpty) {
+                    empty.first.name.text = x;
+                  } else {
+                    addItemRow(x);
+                  }
+                }),
+              ),
+          ]),
+        ),
+      Align(
+        alignment: AlignmentDirectional.centerStart,
+        child: TextButton.icon(
+          onPressed: () => setState(() => addItemRow()),
+          icon: const Icon(Icons.add_circle_outline_rounded, color: C.gold),
+          label: const Text('ضيف صنف', style: TextStyle(color: C.gold, fontWeight: FontWeight.w800)),
+        ),
+      ),
+      if (n > 0)
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            color: (sum > amt && amt > 0 ? C.red : C.emerald).withValues(alpha: 0.10),
+            border: Border.all(color: (sum > amt && amt > 0 ? C.red : C.emerald).withValues(alpha: 0.4)),
+          ),
+          child: Text(
+            sum > amt && amt > 0
+                ? 'مجموع الأصناف ${egp(sum)} أكبر من المبلغ بـ ${egp(sum - amt)} (تنبيه بس)'
+                : 'الأصناف: ${egp(sum)}${amt > sum ? ' • من غير تفصيل: ${egp(amt - sum)}' : ''}',
+            style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w700),
+          ),
+        ),
+      if (itemsErr != null)
+        Padding(padding: const EdgeInsets.only(top: 4), child: Text(itemsErr!, style: const TextStyle(color: C.red, fontSize: 12))),
+    ]);
+  }
+
   @override
   Widget build(BuildContext context) {
     final col = typeColor(type);
@@ -3486,6 +3757,9 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
               keyboardType: const TextInputType.numberWithOptions(decimal: true),
               inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'[0-9٠-٩۰-۹.,٫،]'))],
               style: const TextStyle(fontSize: 34, fontWeight: FontWeight.w900),
+              onChanged: (_) {
+                if (itemRows.isNotEmpty) setState(() {});
+              },
               decoration: InputDecoration(
                 hintText: '0',
                 suffixText: 'جنيه',
@@ -3577,6 +3851,7 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
           ),
           if (personErr != null) Text(personErr!, style: const TextStyle(color: C.red, fontSize: 12)),
         ],
+        if (itemsAllowed) itemsSection(),
         const SectionTitle('اليوم'),
         OutlinedButton.icon(
           onPressed: () async {
@@ -4150,8 +4425,10 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     final v = d;
     await showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
       builder: (c) => SafeArea(
-        child: Padding(
+        child: SingleChildScrollView(
+          child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
           child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
             Text('${kTypeLabels[t.type] ?? t.type} • ${egp(t.amount)}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
@@ -4162,9 +4439,24 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
             if (t.category.isNotEmpty) Text('البند: ${t.group.isEmpty ? '' : '${t.group} • '}${t.category}', style: const TextStyle(color: C.muted)),
             if (t.personId.isNotEmpty) Text('الشخص: ${v.personById(t.personId)?.name ?? ''}', style: const TextStyle(color: C.muted)),
             if (t.note.isNotEmpty) Text('ملاحظة: ${t.note}', style: const TextStyle(color: C.muted)),
+            if (t.items.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              const Text('تفاصيل الصرف', style: TextStyle(color: C.gold, fontWeight: FontWeight.w800)),
+              for (final it in t.items)
+                Row(children: [
+                  Expanded(child: Text('• ${it.name}')),
+                  Text(it.amount == null ? '—' : egp(it.amount!), style: const TextStyle(fontWeight: FontWeight.w700)),
+                ]),
+              if (t.itemsRemainder > 0)
+                Row(children: [
+                  const Expanded(child: Text('• من غير تفصيل', style: TextStyle(color: C.muted))),
+                  Text(egp(t.itemsRemainder), style: const TextStyle(color: C.muted)),
+                ]),
+            ],
             const SizedBox(height: 12),
             Text('ده ${phoneWord(viewName)} — التعديل من عليه هو', style: const TextStyle(color: C.blue, fontWeight: FontWeight.w700)),
           ]),
+        ),
         ),
       ),
     );
@@ -4737,19 +5029,37 @@ class _RecordsTabState extends State<RecordsTab> {
   String q = '';
   String filter = ''; // '' = الكل
   String placeFilter = '';
+  bool allMonths = false; // البحث: الشهر ده / كل الشهور
+  final qCtl = TextEditingController();
+
+  @override
+  void dispose() {
+    qCtl.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final sh = widget.shell;
     final d = sh.d;
     final nq = normalizeAr(q);
-    final list = d.monthTxns(sh.month).where((t) {
+    final base = allMonths
+        ? (List<Txn>.from(d.txns)
+          ..sort((a, b) {
+            final c = b.date.compareTo(a.date);
+            return c != 0 ? c : b.createdAt.compareTo(a.createdAt);
+          }))
+        : d.monthTxns(sh.month);
+    final rs = d.searchByName(q, month: allMonths ? null : sh.month);
+    final list = base.where((t) {
       if (filter.isNotEmpty && t.type != filter) return false;
       if (placeFilter.isNotEmpty && t.placeId != placeFilter && t.toPlaceId != placeFilter) return false;
       if (nq.isEmpty) return true;
+      if (rs.matched.containsKey(t.id)) return true;
       final hay = normalizeAr([
         t.note,
         t.category,
+        ...t.items.map((e) => e.name),
         t.group,
         kTypeLabels[t.type] ?? '',
         d.personName(t.personId),
@@ -4770,15 +5080,59 @@ class _RecordsTabState extends State<RecordsTab> {
           child: Text(arDateShort(t.date), style: const TextStyle(color: C.gold, fontWeight: FontWeight.w800)),
         ));
       }
-      children.add(TxnTile(data: d, t: t, onTap: () => sh.openTxn(t), onLongPress: () => sh.deleteTxn(t)));
+      children.add(TxnTile(
+          data: d, t: t, hits: rs.matched[t.id], onTap: () => sh.openTxn(t), onLongPress: () => sh.deleteTxn(t)));
     }
+    final showTotal = nq.isNotEmpty && rs.txns.isNotEmpty;
     return ListView(padding: const EdgeInsets.fromLTRB(16, 6, 16, 100), children: [
-      MonthSwitcher(month: sh.month, onChanged: (m) => sh.setMonth(m)),
+      if (!allMonths) MonthSwitcher(month: sh.month, onChanged: (m) => sh.setMonth(m)),
       const SizedBox(height: 6),
       TextField(
-        decoration: const InputDecoration(prefixIcon: Icon(Icons.search_rounded), hintText: 'دوّر: بند، شخص، ملاحظة، مبلغ…'),
+        key: const ValueKey('records-search'),
+        controller: qCtl,
+        decoration: const InputDecoration(
+            prefixIcon: Icon(Icons.search_rounded), hintText: 'دوّر: صنف (عيش…)، بند، شخص، ملاحظة، مبلغ…'),
         onChanged: (v) => setState(() => q = v),
       ),
+      const SizedBox(height: 8),
+      Row(children: [
+        for (final all in [false, true])
+          Padding(
+            padding: const EdgeInsetsDirectional.only(end: 6),
+            child: ChoiceChip(
+              avatar: Icon(all ? Icons.all_inclusive_rounded : Icons.calendar_month_rounded, size: 16, color: C.gold),
+              label: Text(all ? 'كل الشهور' : 'الشهر ده'),
+              selected: allMonths == all,
+              showCheckmark: false,
+              selectedColor: C.gold.withValues(alpha: 0.28),
+              onSelected: (_) => setState(() => allMonths = all),
+            ),
+          ),
+      ]),
+      if (showTotal)
+        Container(
+          margin: const EdgeInsets.only(top: 8),
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(18),
+            gradient: LinearGradient(colors: [C.gold.withValues(alpha: 0.22), C.card]),
+            border: Border.all(color: C.gold.withValues(alpha: 0.55)),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('إجمالي «${cleanLabel(q)}» ${allMonths ? '(كل الشهور)' : '(${monthLabel(sh.month)})'}',
+                style: const TextStyle(color: C.gold, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 4),
+            Text(egp(rs.total), style: const TextStyle(fontSize: 26, fontWeight: FontWeight.w900)),
+            Text(
+              [
+                'في ${rs.txns.length} عملية',
+                if (rs.withAmount > 0) '${rs.withAmount} مرة بمبلغ',
+                if (rs.noAmount > 0) '+ ${rs.noAmount} مرة من غير مبلغ',
+              ].join(' • '),
+              style: const TextStyle(color: C.muted, fontSize: 12.5),
+            ),
+          ]),
+        ),
       const SizedBox(height: 10),
       SingleChildScrollView(
         scrollDirection: Axis.horizontal,
@@ -5888,6 +6242,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
           subtitle: Text(d.reasons.isEmpty ? 'لسه مفيش' : d.reasons.join('، '),
               maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: C.muted, fontSize: 12)),
           onTap: () => manageList('أسباب السحب', d.reasons, 'سبب جديد'),
+        ),
+        ListTile(
+          leading: const Icon(Icons.shopping_basket_rounded, color: C.emerald),
+          title: const Text('الأصناف (تفاصيل الصرف)'),
+          subtitle: Text(d.itemNames.isEmpty ? 'لسه مفيش' : d.itemNames.join('، '),
+              maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: C.muted, fontSize: 12)),
+          onTap: () => manageList('الأصناف', d.itemNames, 'صنف جديد'),
         ),
         ListTile(
           leading: const Icon(Icons.receipt_long_rounded, color: C.gold),
