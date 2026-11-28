@@ -42,6 +42,7 @@ class C {
   static const red = Color(0xFFFF6B6B);
   static const blue = Color(0xFF67C7F5);
   static const violet = Color(0xFFB79CFF);
+  static const mine = Color(0xFFFFA45B); // v6: مصروف سجّله التليفون التاني
 }
 
 class A2RMoneyApp extends StatelessWidget {
@@ -307,6 +308,107 @@ const String kPlaceBank = 'bank';
 const String kPlaceWallet = 'wallet';
 const String kPlaceOther = 'other';
 
+// ==================== الرقم السري للأرصدة (v6) ====================
+// SHA-256 مكتوب هنا عشان مانضيفش مكتبة جديدة للبيلد.
+const List<int> _k256 = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+List<int> sha256Bytes(List<int> data) {
+  int rotr(int x, int n) => ((x >> n) | (x << (32 - n))) & 0xffffffff;
+  final h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  final msg = List<int>.from(data)..add(0x80);
+  while (msg.length % 64 != 56) {
+    msg.add(0);
+  }
+  final bits = data.length * 8;
+  for (var i = 7; i >= 0; i--) {
+    msg.add((bits >> (8 * i)) & 0xff);
+  }
+  final w = List<int>.filled(64, 0);
+  for (var off = 0; off < msg.length; off += 64) {
+    for (var i = 0; i < 16; i++) {
+      w[i] = (msg[off + 4 * i] << 24) | (msg[off + 4 * i + 1] << 16) | (msg[off + 4 * i + 2] << 8) | msg[off + 4 * i + 3];
+    }
+    for (var i = 16; i < 64; i++) {
+      final s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      final s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) & 0xffffffff;
+    }
+    var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (var i = 0; i < 64; i++) {
+      final s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      final ch = (e & f) ^ ((~e & 0xffffffff) & g);
+      final t1 = (hh + s1 + ch + _k256[i] + w[i]) & 0xffffffff;
+      final s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      final mj = (a & b) ^ (a & c) ^ (b & c);
+      final t2 = (s0 + mj) & 0xffffffff;
+      hh = g;
+      g = f;
+      f = e;
+      e = (d + t1) & 0xffffffff;
+      d = c;
+      c = b;
+      b = a;
+      a = (t1 + t2) & 0xffffffff;
+    }
+    h[0] = (h[0] + a) & 0xffffffff;
+    h[1] = (h[1] + b) & 0xffffffff;
+    h[2] = (h[2] + c) & 0xffffffff;
+    h[3] = (h[3] + d) & 0xffffffff;
+    h[4] = (h[4] + e) & 0xffffffff;
+    h[5] = (h[5] + f) & 0xffffffff;
+    h[6] = (h[6] + g) & 0xffffffff;
+    h[7] = (h[7] + hh) & 0xffffffff;
+  }
+  final out = <int>[];
+  for (final x in h) {
+    out.addAll([(x >> 24) & 0xff, (x >> 16) & 0xff, (x >> 8) & 0xff, x & 0xff]);
+  }
+  return out;
+}
+
+String hexOf(List<int> b) => b.map((x) => x.toRadixString(16).padLeft(2, '0')).join();
+String sha256Hex(String s) => hexOf(sha256Bytes(utf8.encode(s)));
+
+const int kPinRounds = 2000;
+const int kPinMaxTries = 5;
+const int kPinLockSeconds = 30;
+const int kRevealSeconds = 30;
+
+/// الرقم السري بيتحفظ كـ hash بملح (مش الرقم نفسه)
+String pinHashOf(String salt, String pin) {
+  final sb = utf8.encode(salt);
+  List<int> b = utf8.encode('a2r-money|$salt|$pin');
+  for (var i = 0; i < kPinRounds; i++) {
+    b = sha256Bytes([...b, ...sb]);
+  }
+  return hexOf(b);
+}
+
+String newSalt() {
+  final r = Random.secure();
+  return hexOf(List<int>.generate(16, (_) => r.nextInt(256)));
+}
+
+bool validPin(String pin) => RegExp(r'^\d{4,6}$').hasMatch(pin);
+
+enum PinState { ok, wrong, locked }
+
+class PinTry {
+  final PinState state;
+  final int triesLeft; // بعد الغلط
+  final int waitSeconds; // لو مقفول
+  const PinTry(this.state, {this.triesLeft = 0, this.waitSeconds = 0});
+}
+
 class Place {
   String id;
   String name;
@@ -415,6 +517,9 @@ class Txn {
   String refId; // استلام تحويل: رقم التحويل اللي جه من الأساسي (عشان مايتسجلش مرتين)
   String createdAt;
   List<TxnItem> items; // «تفاصيل الصرف» (اختياري)
+  String authorId; // v6: لو اتسجلت من تليفون تاني ← رقم التليفون اللي سجّلها
+  String authorName; // v6: اسم التليفون اللي سجّلها
+  bool pending = false; // v6 (مش بيتحفظ): سجّلتها لتليفون تاني ولسه ماوصلتلوش
   Txn({
     required this.id,
     required this.type,
@@ -431,6 +536,8 @@ class Txn {
     this.refId = '',
     String? createdAt,
     List<TxnItem>? items,
+    this.authorId = '',
+    this.authorName = '',
   })  : createdAt = createdAt ?? DateTime.now().toIso8601String(),
         items = items ?? [];
 
@@ -450,6 +557,8 @@ class Txn {
         if (refId.isNotEmpty) 'refId': refId,
         'createdAt': createdAt,
         if (items.isNotEmpty) 'items': items.map((e) => e.toJson()).toList(),
+        if (authorId.isNotEmpty) 'authorId': authorId,
+        if (authorName.isNotEmpty) 'authorName': authorName,
       };
   factory Txn.fromJson(Map<String, dynamic> j) => Txn(
         id: '${j['id']}',
@@ -469,8 +578,13 @@ class Txn {
         items: (j['items'] is List)
             ? (j['items'] as List).map(TxnItem.fromJson).whereType<TxnItem>().toList()
             : null,
+        authorId: '${j['authorId'] ?? ''}',
+        authorName: cleanLabel('${j['authorName'] ?? ''}'),
       );
-  Txn copy() => Txn.fromJson(toJson());
+  Txn copy() => Txn.fromJson(toJson())..pending = pending;
+
+  /// v6: اتسجلت من تليفون تاني (أو سجّلتها انا لتليفون تاني)
+  bool get byOther => authorId.isNotEmpty;
 
   /// يدخل في «إجمالي الصرف»: مصروف + فاتورة + سحب
   bool get isSpend => type == tExpense || type == tBill || type == tWithdraw;
@@ -609,9 +723,10 @@ class PeerInfo {
 class CopyResult {
   final bool ok;
   final String message;
-  final int months, listsAdded;
+  final int months, listsAdded, entries, confirmed;
   final String fromName, exportedAt;
-  const CopyResult(this.ok, this.message, {this.months = 0, this.listsAdded = 0, this.fromName = '', this.exportedAt = ''});
+  const CopyResult(this.ok, this.message,
+      {this.months = 0, this.listsAdded = 0, this.fromName = '', this.exportedAt = '', this.entries = 0, this.confirmed = 0});
 }
 
 /// اللي «تحديث» هيعمله
@@ -749,6 +864,16 @@ class MoneyData {
   String syncFolder; // فولدر الاستلام اللي اتحدد مرة واحدة ('' = لسه)
   /// آخر صورة كاملة من كل تليفون تاني (عشان تتفرج عليه): تليفون ← {name, at, data}
   Map<String, Map<String, dynamic>> peers;
+  // v6: إخفاء الأرصدة برقم سري (hash بملح — عمره ما بيتبعت للتليفون التاني)
+  String pinSalt;
+  String pinHash;
+  int pinLen;
+  int pinFails;
+  String pinLockUntil;
+  /// v6: مصروفات سجّلتها انا لتليفون تاني (لسه ماتأكدش إنها وصلت): رقم العملية ← {to, toName, txn}
+  Map<String, Map<String, dynamic>> outbox;
+  /// v6: أرقام المصروفات اللي جاتلي من تليفون تاني واتسجلت عندي (عشان ماتتسجلش مرتين أبدًا)
+  List<String> peerSeen;
 
   MoneyData({
     required this.phoneId,
@@ -770,7 +895,16 @@ class MoneyData {
     this.peerName = '',
     this.syncFolder = '',
     Map<String, Map<String, dynamic>>? peers,
+    this.pinSalt = '',
+    this.pinHash = '',
+    this.pinLen = 0,
+    this.pinFails = 0,
+    this.pinLockUntil = '',
+    Map<String, Map<String, dynamic>>? outbox,
+    List<String>? peerSeen,
   })  : peers = peers ?? {},
+        outbox = outbox ?? {},
+        peerSeen = peerSeen ?? [],
         sources = sources ?? [],
         reasons = reasons ?? [],
         itemNames = itemNames ?? [],
@@ -838,6 +972,13 @@ class MoneyData {
         'peerName': peerName,
         'syncFolder': syncFolder,
         'peers': peers,
+        if (pinHash.isNotEmpty) 'pinSalt': pinSalt,
+        if (pinHash.isNotEmpty) 'pinHash': pinHash,
+        if (pinHash.isNotEmpty) 'pinLen': pinLen,
+        if (pinFails > 0) 'pinFails': pinFails,
+        if (pinLockUntil.isNotEmpty) 'pinLockUntil': pinLockUntil,
+        if (outbox.isNotEmpty) 'outbox': outbox,
+        if (peerSeen.isNotEmpty) 'peerSeen': peerSeen,
       };
 
   factory MoneyData.fromJson(Map<String, dynamic> j) {
@@ -900,8 +1041,91 @@ class MoneyData {
       peerName: '${j['peerName'] ?? ''}',
       syncFolder: '${j['syncFolder'] ?? ''}',
       peers: _peersFrom(j['peers']),
+      pinSalt: '${j['pinSalt'] ?? ''}',
+      pinHash: '${j['pinHash'] ?? ''}',
+      pinLen: (j['pinLen'] as num?)?.toInt() ?? 0,
+      pinFails: (j['pinFails'] as num?)?.toInt() ?? 0,
+      pinLockUntil: '${j['pinLockUntil'] ?? ''}',
+      outbox: _outboxFrom(j['outbox']),
+      peerSeen: (j['peerSeen'] is List) ? [for (final e in j['peerSeen'] as List) '$e'] : null,
     );
   }
+
+  static Map<String, Map<String, dynamic>> _outboxFrom(dynamic raw) {
+    final out = <String, Map<String, dynamic>>{};
+    if (raw is Map) {
+      raw.forEach((k, v) {
+        if (v is Map && v['txn'] is Map && '${v['to'] ?? ''}'.isNotEmpty) out['$k'] = Map<String, dynamic>.from(v);
+      });
+    }
+    return out;
+  }
+
+  // ---------- v6: الرقم السري ----------
+  bool get hasPin => pinHash.isNotEmpty && pinSalt.isNotEmpty;
+
+  void setPin(String pin) {
+    if (!validPin(pin)) throw ArgumentError('pin');
+    pinSalt = newSalt();
+    pinHash = pinHashOf(pinSalt, pin);
+    pinLen = pin.length;
+    pinFails = 0;
+    pinLockUntil = '';
+  }
+
+  void clearPin() {
+    pinSalt = '';
+    pinHash = '';
+    pinLen = 0;
+    pinFails = 0;
+    pinLockUntil = '';
+  }
+
+  /// ثواني الانتظار الباقية بعد 5 مرات غلط (0 = مفتوح)
+  int pinWaitSeconds(DateTime now) {
+    final u = DateTime.tryParse(pinLockUntil);
+    if (u == null) return 0;
+    final left = u.difference(now).inMilliseconds;
+    return left <= 0 ? 0 : (left / 1000).ceil();
+  }
+
+  /// تجربة الرقم: صح / غلط (فاضل كام) / مقفول (استنى كام ثانية). 5 مرات غلط ← 30 ثانية.
+  PinTry tryPin(String pin, DateTime now) {
+    final wait = pinWaitSeconds(now);
+    if (wait > 0) return PinTry(PinState.locked, waitSeconds: wait);
+    if (hasPin && pinHashOf(pinSalt, pin) == pinHash) {
+      pinFails = 0;
+      pinLockUntil = '';
+      return const PinTry(PinState.ok);
+    }
+    pinFails++;
+    if (pinFails >= kPinMaxTries) {
+      pinFails = 0;
+      pinLockUntil = now.add(const Duration(seconds: kPinLockSeconds)).toIso8601String();
+      return const PinTry(PinState.locked, waitSeconds: kPinLockSeconds);
+    }
+    return PinTry(PinState.wrong, triesLeft: kPinMaxTries - pinFails);
+  }
+
+  // ---------- v6: مصروفات بسجّلها لتليفون تاني ----------
+  /// بتتحفظ عندي «لسه ماوصلتش» وبتتبعت جوه «ابعت نسختي» لحد ما التليفون التاني يأكد إنها وصلت
+  Txn addPeerEntry(String peerId, String peerName, Txn t) {
+    final x = t.copy()
+      ..authorId = phoneId
+      ..authorName = badgeName
+      ..pending = false;
+    outbox[x.id] = {'to': peerId, 'toName': cleanLabel(peerName), 'at': DateTime.now().toIso8601String(), 'txn': x.toJson()};
+    return x;
+  }
+
+  /// اللي لسه ماوصلش للتليفون ده
+  List<Txn> pendingFor(String peerId) => [
+        for (final v in outbox.values)
+          if ('${v['to']}' == peerId) Txn.fromJson(Map<String, dynamic>.from(v['txn'] as Map))..pending = true
+      ];
+
+  /// مسح مصروف سجّلته لتليفون تاني (قبل ما يوصله بس)
+  bool removePeerEntry(String id) => outbox.remove(id) != null;
 
   static Map<String, Map<String, dynamic>> _peersFrom(dynamic raw) {
     final out = <String, Map<String, dynamic>>{};
@@ -918,10 +1142,13 @@ class MoneyData {
   /// من غير اللي جاله من تليفونات تانية ومن غير إعدادات الاستلام.
   Map<String, dynamic> snapshotJson() {
     final j = toJson();
-    for (final k in ['imported', 'copySeen', 'syncFolder', 'peers', 'lastPlaceId', 'lastInPlaceId']) {
+    for (final k in ['imported', 'copySeen', 'syncFolder', 'peers', 'lastPlaceId', 'lastInPlaceId',
+      'pinSalt', 'pinHash', 'pinLen', 'pinFails', 'pinLockUntil', 'outbox', 'peerSeen']) {
       j.remove(k);
     }
     j['phoneName'] = badgeName;
+    // v6: المصروفات اللي جاتلي من التليفون التاني واتسجلت (عشان يعرف إنها وصلت حتى لو مسحتها بعدين)
+    if (peerSeen.isNotEmpty) j['gotEntries'] = List<String>.from(peerSeen);
     j['balances'] = {for (final p in places) p.id: balanceOf(p.id)};
     return j;
   }
@@ -945,12 +1172,14 @@ class MoneyData {
     final v = peers[pid];
     if (v != null && v['data'] is Map) {
       final dj = Map<String, dynamic>.from(v['data'] as Map);
-      dj.remove('imported');
-      dj.remove('peers');
+      for (final k in ['imported', 'peers', 'pinSalt', 'pinHash', 'pinLen', 'pinFails', 'pinLockUntil', 'outbox', 'peerSeen']) {
+        dj.remove(k);
+      }
       final pd = MoneyData.fromJson(dj);
       pd.phoneId = pid;
       if (cleanLabel(pd.phoneName).isEmpty) pd.phoneName = '${v['name'] ?? ''}';
       pd.peerName = badgeName;
+      _addPending(pd, pid);
       return pd;
     }
     // نسخة قديمة (v3 أو ملف شهر): من الشهور اللي وصلت بس
@@ -992,7 +1221,17 @@ class MoneyData {
       if (eb == null) continue;
       p.opening = eb - pd.balanceOf(p.id, upTo: lastDay);
     }
+    _addPending(pd, pid);
     return pd;
+  }
+
+  /// v6: المصروفات اللي سجّلتها للتليفون ده ولسه ماوصلتش ← بتظهر في الفرجة وبتأثر على رصيده (معاينة)
+  void _addPending(MoneyData pd, String pid) {
+    final have = {for (final t in pd.txns) t.id};
+    for (final t in pendingFor(pid)) {
+      if (have.contains(t.id)) continue;
+      pd.txns.add(t);
+    }
   }
 
   static String _guessKind(String name) {
@@ -1137,13 +1376,13 @@ class MoneyData {
       balanceOf(placeId, excludeTxnId: replacingId) + deltaFor(t, placeId);
 
   /// الأماكن اللي هتبقى بالسالب بعد العملية دي (تحذير بس، مش منع)
-  List<String> negativeWarnings(Txn t, {String? replacingId}) {
+  List<String> negativeWarnings(Txn t, {String? replacingId, bool hideAmounts = false}) {
     final out = <String>[];
     final ids = {t.placeId, if (t.type == tTransfer) t.toPlaceId}..remove('');
     for (final id in ids) {
       if (deltaFor(t, id) >= 0) continue;
       final after = balanceAfter(t, id, replacingId: replacingId);
-      if (after < 0) out.add('${placeName(id)} هيبقى ${egp(after)}');
+      if (after < 0) out.add(hideAmounts ? '${placeName(id)} هيبقى بالسالب' : '${placeName(id)} هيبقى ${egp(after)}');
     }
     return out;
   }
@@ -1484,6 +1723,8 @@ class MoneyData {
       'lists': exportLists(),
       // v4: صورة كاملة عشان التليفون التاني يقدر يتفرج على أرصدتك وعملياتك
       'snapshot': snapshotJson(),
+      // v6: مصروفات سجّلتها للتليفون التاني (بتتبعت لحد ما يأكد إنها وصلت؛ هو بيمنع التكرار)
+      if (outbox.isNotEmpty) 'forPeers': [for (final e in outbox.entries) {'id': e.key, 'to': e.value['to'], 'txn': e.value['txn']}],
     };
   }
 
@@ -1543,8 +1784,74 @@ class MoneyData {
     copySeen[pid] = at;
     learnPeer(name);
     final who = name.isEmpty ? otherName : name;
-    return CopyResult(true, 'اتحدث من «$who» — $n شهر${listsAdded > 0 ? ' • اتضاف $listsAdded من القوايم' : ''}',
-        months: n, listsAdded: listsAdded, fromName: who, exportedAt: at);
+    // v6: المصروفات اللي التليفون التاني سجّلها لي ← تتسجل عندي مرة واحدة بس
+    final got = importPeerEntries(j['forPeers'], pid, who);
+    // v6: اللي انا سجّلته له ووصله ← خلاص مش «لسه ماوصلتش»
+    final confirmed = confirmPeerEntries(j['snapshot'], pid);
+    return CopyResult(
+        true,
+        'اتحدث من «$who» — $n شهر${listsAdded > 0 ? ' • اتضاف $listsAdded من القوايم' : ''}'
+        '${got > 0 ? ' • اتسجل $got مصروف سجّلهم $who' : ''}${confirmed > 0 ? ' • $confirmed مصروف سجّلتهم وصلوا' : ''}',
+        months: n,
+        listsAdded: listsAdded,
+        fromName: who,
+        exportedAt: at,
+        entries: got,
+        confirmed: confirmed);
+  }
+
+  /// v6: استيراد المصروفات اللي اتسجلت لي من تليفون تاني. التكرار ممنوع برقم العملية (حتى بعد ما أمسحها أو أرجّع نسخة احتياطية).
+  int importPeerEntries(dynamic raw, String fromPid, String fromName) {
+    if (raw is! List) return 0;
+    var n = 0;
+    for (final e in raw.whereType<Map>()) {
+      if ('${e['to'] ?? ''}' != phoneId || e['txn'] is! Map) continue;
+      final Txn t;
+      try {
+        t = Txn.fromJson(Map<String, dynamic>.from(e['txn'] as Map));
+      } catch (_) {
+        continue;
+      }
+      if (t.id.isEmpty || t.id == 'null' || '${e['id'] ?? t.id}' != t.id) continue;
+      if (peerSeen.contains(t.id) || txns.any((x) => x.id == t.id)) continue;
+      if (t.type != tExpense || t.amount <= 0 || !RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(t.date)) continue;
+      if (t.authorId != fromPid) continue;
+      final pl = placeById(t.placeId);
+      if (pl == null) {
+        final fb = activePlaces.isNotEmpty ? activePlaces.first : (places.isNotEmpty ? places.first : null);
+        if (fb == null) continue;
+        t.note = [t.note, '(المكان اللي اتختار اتمسح — اتسجلت على ${fb.name})'].where((x) => x.isNotEmpty).join(' ');
+        t.placeId = fb.id;
+      }
+      if (t.personId.isNotEmpty && personById(t.personId) == null) t.personId = '';
+      if (t.authorName.isEmpty) t.authorName = fromName;
+      t.pending = false;
+      if (t.category.isNotEmpty) t.category = addCategory(t.group, t.category);
+      learnItems(t);
+      txns.add(t); // مش upsert: عشان مايغيرش «آخر مكان» عندي
+      peerSeen.add(t.id);
+      n++;
+    }
+    return n;
+  }
+
+  /// v6: اللي سجّلته لتليفون تاني وظهر في نسخته (أو في قايمة اللي وصله) ← يتشال من «لسه ماوصلتش»
+  int confirmPeerEntries(dynamic snap, String pid) {
+    if (snap is! Map || outbox.isEmpty) return 0;
+    final ids = <String>{};
+    if (snap['txns'] is List) {
+      for (final t in (snap['txns'] as List).whereType<Map>()) {
+        ids.add('${t['id']}');
+      }
+    }
+    if (snap['gotEntries'] is List) {
+      for (final x in snap['gotEntries'] as List) {
+        ids.add('$x');
+      }
+    }
+    final before = outbox.length;
+    outbox.removeWhere((k, v) => '${v['to']}' == pid && ids.contains(k));
+    return before - outbox.length;
   }
 
   /// «تحديث»: من كل الملفات اللي في فولدر الاستلام بيختار الأحدث (بالوقت اللي جوه الملف، مش الاسم)
@@ -2788,7 +3095,7 @@ class ViewBanner extends StatelessWidget {
                 style: const TextStyle(fontWeight: FontWeight.w900, color: C.blue)),
           ),
         ]),
-        Text('آخر نسخة ${fmtStamp(at)} • فرجة بس، مفيش تعديل', style: const TextStyle(color: C.muted, fontSize: 12)),
+        Text('آخر نسخة ${fmtStamp(at)} • تقدر تسجّل مصروف ليه — الباقي فرجة بس', style: const TextStyle(color: C.muted, fontSize: 12)),
         if (partial)
           Text('نسخة قديمة — خلي $name يحدّث التطبيق ويبعت نسخة عشان الأرصدة تبان كاملة',
               style: const TextStyle(color: C.gold, fontSize: 11.5)),
@@ -2892,6 +3199,303 @@ void toast(BuildContext context, String m, {bool bad = false}) {
     backgroundColor: bad ? const Color(0xFF7F1D1D) : C.card2,
     duration: Duration(seconds: bad ? 5 : 3),
   ));
+}
+
+// ==================== v6: إخفاء الأرصدة (زي المحافظ الإلكترونية) ====================
+
+/// حالة الإخفاء: الأرصدة بتبان «••••••» ولما تدوس على رقم واحد وتكتب الرقم السري يبان هو بس (30 ثانية).
+class BalanceGuard extends ChangeNotifier {
+  MoneyData? data;
+  Future<void> Function()? save;
+  String _shown = ''; // الرقم الوحيد اللي باين دلوقتي
+  Timer? _timer;
+
+  bool get enabled => data?.hasPin ?? false;
+  bool isShown(String key) => !enabled || _shown == key;
+
+  void attach(MoneyData d, Future<void> Function() onSave) {
+    if (!identical(data, d)) hideAll(notify: false);
+    data = d;
+    save = onSave;
+  }
+
+  void reveal(String key) {
+    _shown = key;
+    _timer?.cancel();
+    _timer = Timer(const Duration(seconds: kRevealSeconds), () => hideAll());
+    notifyListeners();
+  }
+
+  void hideAll({bool notify = true}) {
+    _timer?.cancel();
+    _timer = null;
+    if (_shown.isEmpty) return;
+    _shown = '';
+    if (notify) notifyListeners();
+  }
+
+  /// نص فيه مبلغ رصيد (رسالة/تحذير): لو الإخفاء شغال ← نجوم
+  String text(int v) => enabled ? '•••••• جنيه' : egp(v);
+}
+
+final balanceGuard = BalanceGuard();
+
+/// يطلب الرقم السري. true = صح.
+Future<bool> askPin(BuildContext context, {String title = 'اكتب الرقم السري'}) async {
+  final d = balanceGuard.data;
+  if (d == null || !d.hasPin) return true;
+  final r = await showDialog<bool>(
+    context: context,
+    barrierDismissible: true,
+    builder: (c) => PinPadDialog(title: title, verify: d),
+  );
+  await balanceGuard.save?.call();
+  return r == true;
+}
+
+Future<void> revealWithPin(BuildContext context, String key) async {
+  if (await askPin(context)) balanceGuard.reveal(key);
+}
+
+/// رقم رصيد: مخفي «••••••» لحد ما تدوس عليه وتكتب الرقم السري (بيبان هو بس)
+class MaskedAmount extends StatelessWidget {
+  final String keyId;
+  final String text;
+  final TextStyle? style;
+  final bool showIcon;
+  const MaskedAmount({super.key, required this.keyId, required this.text, this.style, this.showIcon = true});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: balanceGuard,
+      builder: (context, _) {
+        if (balanceGuard.isShown(keyId)) {
+          if (!balanceGuard.enabled) return Text(text, style: style);
+          return GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: () => balanceGuard.hideAll(),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Text(text, style: style),
+              if (showIcon) ...[
+                const SizedBox(width: 4),
+                Icon(Icons.visibility_off_rounded, size: (style?.fontSize ?? 14) * 0.7, color: C.muted),
+              ],
+            ]),
+          );
+        }
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => revealWithPin(context, keyId),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            Text('••••••', style: (style ?? const TextStyle()).copyWith(letterSpacing: 2)),
+            if (showIcon) ...[
+              const SizedBox(width: 4),
+              Icon(Icons.visibility_rounded, size: (style?.fontSize ?? 14) * 0.7, color: C.gold),
+            ],
+          ]),
+        );
+      },
+    );
+  }
+}
+
+/// لوحة أرقام: [verify] = اتأكد من الرقم (بيرجع true)، أو من غيره = اكتب رقم جديد (بيرجع الرقم)
+class PinPadDialog extends StatefulWidget {
+  final String title;
+  final String subtitle;
+  final MoneyData? verify;
+  const PinPadDialog({super.key, required this.title, this.subtitle = '', this.verify});
+  @override
+  State<PinPadDialog> createState() => _PinPadDialogState();
+}
+
+class _PinPadDialogState extends State<PinPadDialog> {
+  String pin = '';
+  String msg = '';
+  bool bad = false;
+  Timer? _tick;
+
+  bool get verifying => widget.verify != null;
+  int get maxLen => verifying ? (widget.verify!.pinLen >= 4 ? widget.verify!.pinLen : 6) : 6;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkLock();
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  void _checkLock() {
+    final d = widget.verify;
+    if (d == null) return;
+    final w = d.pinWaitSeconds(DateTime.now());
+    _tick?.cancel();
+    if (w > 0) {
+      setState(() {
+        msg = 'غلط 5 مرات — استنى $w ثانية';
+        bad = true;
+      });
+      _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted) return;
+        final l = d.pinWaitSeconds(DateTime.now());
+        setState(() {
+          if (l <= 0) {
+            _tick?.cancel();
+            msg = '';
+            bad = false;
+          } else {
+            msg = 'غلط 5 مرات — استنى $l ثانية';
+          }
+        });
+      });
+    }
+  }
+
+  bool get locked => verifying && widget.verify!.pinWaitSeconds(DateTime.now()) > 0;
+
+  void _press(String k) {
+    if (locked) return;
+    setState(() {
+      if (k == '<') {
+        if (pin.isNotEmpty) pin = pin.substring(0, pin.length - 1);
+      } else if (pin.length < maxLen) {
+        pin += k;
+      }
+      if (!bad || pin.isNotEmpty) msg = locked ? msg : '';
+      bad = false;
+    });
+    if (verifying && pin.length == maxLen) _submit();
+  }
+
+  void _submit() {
+    if (!verifying) {
+      if (!validPin(pin)) {
+        setState(() {
+          msg = 'الرقم السري من 4 لـ 6 أرقام';
+          bad = true;
+        });
+        return;
+      }
+      Navigator.pop(context, pin);
+      return;
+    }
+    final r = widget.verify!.tryPin(pin, DateTime.now());
+    if (r.state == PinState.ok) {
+      Navigator.pop(context, true);
+      return;
+    }
+    HapticFeedback.vibrate();
+    setState(() {
+      pin = '';
+      bad = true;
+      msg = r.state == PinState.locked ? 'غلط 5 مرات — استنى ${r.waitSeconds} ثانية' : 'الرقم غلط — فاضل ${r.triesLeft} محاولة';
+    });
+    balanceGuard.save?.call();
+    if (r.state == PinState.locked) _checkLock();
+  }
+
+  Widget _key(String k) {
+    final icon = k == '<' ? Icons.backspace_outlined : (k == 'ok' ? Icons.check_rounded : null);
+    return Padding(
+      padding: const EdgeInsets.all(5),
+      child: Material(
+        color: k == 'ok' ? C.gold.withValues(alpha: 0.22) : C.bg2,
+        shape: const CircleBorder(side: BorderSide(color: C.line)),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: k.isEmpty ? null : () => k == 'ok' ? _submit() : _press(k),
+          child: SizedBox(
+            width: 62,
+            height: 62,
+            child: Center(
+              child: icon != null
+                  ? Icon(icon, color: k == 'ok' ? C.gold : C.muted)
+                  : Text(k, style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800)),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final dots = verifying ? maxLen : max(4, pin.length);
+    return Dialog(
+      backgroundColor: C.card,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(26), side: BorderSide(color: C.gold.withValues(alpha: 0.4))),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(18, 20, 18, 14),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.lock_rounded, color: C.gold, size: 30),
+          const SizedBox(height: 6),
+          Text(widget.title, textAlign: TextAlign.center, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+          if (widget.subtitle.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Text(widget.subtitle, textAlign: TextAlign.center, style: const TextStyle(color: C.muted, fontSize: 12.5)),
+            ),
+          const SizedBox(height: 14),
+          Directionality(
+            textDirection: TextDirection.ltr,
+            child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+              for (var i = 0; i < dots; i++)
+                Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 6),
+                  width: 14,
+                  height: 14,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: i < pin.length ? (bad ? C.red : C.gold) : Colors.transparent,
+                    border: Border.all(color: bad ? C.red : C.gold, width: 1.6),
+                  ),
+                ),
+            ]),
+          ),
+          SizedBox(
+            height: 26,
+            child: Center(
+              child: Text(msg, style: TextStyle(color: bad ? C.red : C.muted, fontSize: 12.5, fontWeight: FontWeight.w700)),
+            ),
+          ),
+          Directionality(
+            textDirection: TextDirection.ltr,
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              for (final row in [
+                ['1', '2', '3'],
+                ['4', '5', '6'],
+                ['7', '8', '9'],
+                [verifying ? '' : 'ok', '0', '<'],
+              ])
+                Row(mainAxisSize: MainAxisSize.min, children: [for (final k in row) _key(k)]),
+            ]),
+          ),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+        ]),
+      ),
+    );
+  }
+}
+
+/// رقم سري جديد: يتكتب مرتين. null = اتلغى.
+Future<String?> askNewPin(BuildContext context) async {
+  final a = await showDialog<String>(
+      context: context, builder: (c) => const PinPadDialog(title: 'رقم سري جديد', subtitle: 'من 4 لـ 6 أرقام'));
+  if (a == null || !context.mounted) return null;
+  final b = await showDialog<String>(
+      context: context, builder: (c) => const PinPadDialog(title: 'اكتبه تاني للتأكيد'));
+  if (b == null || !context.mounted) return null;
+  if (a != b) {
+    toast(context, 'الرقمين مش زي بعض — جرّب تاني', bad: true);
+    return null;
+  }
+  return a;
 }
 
 Future<String?> askText(BuildContext context, String title, {String initial = '', String hint = '', bool allowEmpty = false}) async {
@@ -3095,7 +3699,10 @@ class PlaceField extends StatelessWidget {
             if (p != null)
               Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
                 const Text('الرصيد دلوقتي', style: TextStyle(fontSize: 10.5, color: C.muted)),
-                Text(egp(bal), style: TextStyle(fontWeight: FontWeight.w800, color: bal < 0 ? C.red : C.emerald)),
+                MaskedAmount(
+                    keyId: 'field:${data.phoneId}:${p.id}',
+                    text: egp(bal),
+                    style: TextStyle(fontWeight: FontWeight.w800, color: bal < 0 ? C.red : C.emerald)),
               ]),
             const SizedBox(width: 6),
             const Icon(Icons.expand_more_rounded, color: C.muted),
@@ -3134,7 +3741,10 @@ Future<String?> pickPlace(BuildContext context, MoneyData d, {required String ti
                     title: Text(p.name, style: const TextStyle(fontWeight: FontWeight.w800)),
                     trailing: Builder(builder: (_) {
                       final b = d.balanceOf(p.id, excludeTxnId: replacingTxnId);
-                      return Text(egp(b), style: TextStyle(fontWeight: FontWeight.w800, color: b < 0 ? C.red : C.emerald));
+                      return MaskedAmount(
+                          keyId: 'pick:${d.phoneId}:${p.id}',
+                          text: egp(b),
+                          style: TextStyle(fontWeight: FontWeight.w800, color: b < 0 ? C.red : C.emerald));
                     }),
                     onTap: () => Navigator.pop(c, p.id),
                   ),
@@ -3148,6 +3758,37 @@ Future<String?> pickPlace(BuildContext context, MoneyData d, {required String ti
 }
 
 // ---------- كارت عملية ----------
+
+/// v6: «سجّلها <اسم التليفون>» (+ «لسه ماوصلتش» لو لسه ماوصلتش للتليفون التاني)
+class AuthorChip extends StatelessWidget {
+  final Txn t;
+  const AuthorChip({super.key, required this.t});
+  @override
+  Widget build(BuildContext context) {
+    final who = t.authorName.isEmpty ? 'التليفون التاني' : t.authorName;
+    return Wrap(spacing: 6, runSpacing: 4, children: [
+      Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+        decoration: BoxDecoration(color: C.mine.withValues(alpha: 0.18), borderRadius: BorderRadius.circular(20), border: Border.all(color: C.mine)),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          const Icon(Icons.edit_rounded, size: 12, color: C.mine),
+          const SizedBox(width: 4),
+          Text('سجّلها $who', style: const TextStyle(fontSize: 11.5, color: C.mine, fontWeight: FontWeight.w800)),
+        ]),
+      ),
+      if (t.pending)
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+          decoration: BoxDecoration(borderRadius: BorderRadius.circular(20), border: Border.all(color: C.muted)),
+          child: const Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(Icons.schedule_rounded, size: 12, color: C.muted),
+            SizedBox(width: 4),
+            Text('لسه ماوصلتش', style: TextStyle(fontSize: 11.5, color: C.muted, fontWeight: FontWeight.w700)),
+          ]),
+        ),
+    ]);
+  }
+}
 
 class TxnTile extends StatelessWidget {
   final MoneyData data;
@@ -3205,7 +3846,10 @@ class TxnTile extends StatelessWidget {
           onLongPress: onLongPress,
           child: Container(
             padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(borderRadius: BorderRadius.circular(18), border: Border.all(color: C.line)),
+            decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(18),
+                color: t.byOther ? C.mine.withValues(alpha: t.pending ? 0.07 : 0.10) : null,
+                border: Border.all(color: t.byOther ? C.mine.withValues(alpha: 0.85) : C.line, width: t.byOther ? 1.4 : 1)),
             child: Row(children: [
               Container(
                 width: 42,
@@ -3238,6 +3882,7 @@ class TxnTile extends StatelessWidget {
                       ),
                     ),
                   if (t.note.isNotEmpty) Text(t.note, style: const TextStyle(fontSize: 12, color: C.text), maxLines: 4, overflow: TextOverflow.ellipsis),
+                  if (t.byOther) Padding(padding: const EdgeInsets.only(top: 4), child: AuthorChip(t: t)),
                 ]),
               ),
               const SizedBox(width: 8),
@@ -3262,6 +3907,8 @@ class TxnFormScreen extends StatefulWidget {
   final Bill? bill; // دفع فاتورة
   final String? billMonth;
   final String? presetPersonId;
+  /// v6: بسجّل المصروف ده لتليفون تاني (من أماكنه)
+  final String? forName;
   const TxnFormScreen({
     super.key,
     required this.data,
@@ -3270,6 +3917,7 @@ class TxnFormScreen extends StatefulWidget {
     this.bill,
     this.billMonth,
     this.presetPersonId,
+    this.forName,
   });
   @override
   State<TxnFormScreen> createState() => _TxnFormScreenState();
@@ -3355,6 +4003,7 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
   String get title {
     if (widget.bill != null) return 'دفع فاتورة ${widget.bill!.name}';
     final l = type == tToPhone ? 'تحويل لـ ${d.otherName}' : (kTypeLabels[type] ?? type);
+    if (widget.forName != null) return '$l لـ ${widget.forName}';
     return editing ? 'تعديل $l' : l;
   }
 
@@ -3434,6 +4083,8 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
       refId: widget.existing?.refId ?? '',
       createdAt: widget.existing?.createdAt,
       items: items,
+      authorId: widget.existing?.authorId ?? '',
+      authorName: widget.existing?.authorName ?? '',
     );
     // تحذير بس (مش منع) لو الأصناف أكبر من المبلغ
     if (t.itemsSum > t.amount) {
@@ -3444,7 +4095,7 @@ class _TxnFormScreenState extends State<TxnFormScreen> {
       if (!mounted) return;
     }
     // تحذير بس (مش منع) لو مكان هيبقى بالسالب
-    final warn = d.negativeWarnings(t, replacingId: widget.existing?.id);
+    final warn = d.negativeWarnings(t, replacingId: widget.existing?.id, hideAmounts: balanceGuard.enabled);
     if (warn.isNotEmpty) {
       final go = await confirmDialog(context, 'الرصيد هيبقى بالسالب',
           '${warn.join('\n')}\n\nتسجّل برضه؟',
@@ -4141,6 +4792,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   MoneyData? _view;
   String _viewPid = '';
   bool get viewOnly => _view != null;
+  /// v6: مفتاح الأرقام المخفية (تليفوني غير التليفون التاني)
+  String get viewKey => viewOnly ? 'v:$_viewPid:' : '';
   String get viewName => d.badgeName;
   PeerInfo? get viewInfo {
     if (!viewOnly) return null;
@@ -4163,6 +4816,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       toast(context, 'مفيش نسخة من التليفون ده — دوس تحديث', bad: true);
       return;
     }
+    balanceGuard.hideAll();
     setState(() {
       _view = v;
       _viewPid = pid;
@@ -4171,6 +4825,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
 
   void exitView() {
     if (!viewOnly) return;
+    balanceGuard.hideAll();
     setState(() {
       _view = null;
       _viewPid = '';
@@ -4190,6 +4845,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     if (!identical(old.data, widget.data)) {
       _view = null;
       _viewPid = '';
+      balanceGuard.attach(own, persist);
     }
   }
 
@@ -4197,6 +4853,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    balanceGuard.attach(own, persist);
     WidgetsBinding.instance.addPostFrameCallback((_) => _checkStorage());
   }
 
@@ -4209,6 +4866,8 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState s) {
+    // v6: أي رقم رصيد باين يتخبى لما التطبيق يروح الخلفية
+    if (s != AppLifecycleState.resumed) balanceGuard.hideAll();
     if (s == AppLifecycleState.paused) {
       _backupTimer?.cancel();
       writeAutoBackup(own);
@@ -4272,7 +4931,9 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       if (mounted) {
         final t = r.saved!;
         toast(context,
-            '${kTypeLabels[t.type]} ${egp(t.amount)} • ${d.placeName(t.placeId)} دلوقتي ${egp(d.balanceOf(t.placeId))}');
+            balanceGuard.enabled
+                ? '${kTypeLabels[t.type]} ${egp(t.amount)} • ${d.placeName(t.placeId)}'
+                : '${kTypeLabels[t.type]} ${egp(t.amount)} • ${d.placeName(t.placeId)} دلوقتي ${egp(d.balanceOf(t.placeId))}');
         if (t.type == tToPhone && existing == null) {
           final go = await confirmDialog(context, 'تبعت التحويل؟',
               'هيتعمل ملف صغير بـ ${egp(t.amount)} تبعته على واتساب للتليفون التاني.\n'
@@ -4453,8 +5114,23 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
                   Text(egp(t.itemsRemainder), style: const TextStyle(color: C.muted)),
                 ]),
             ],
+            if (t.byOther) ...[
+              const SizedBox(height: 10),
+              AuthorChip(t: t),
+            ],
             const SizedBox(height: 12),
-            Text('ده ${phoneWord(viewName)} — التعديل من عليه هو', style: const TextStyle(color: C.blue, fontWeight: FontWeight.w700)),
+            if (t.pending && t.authorId == own.phoneId)
+              FilledButton.icon(
+                style: FilledButton.styleFrom(backgroundColor: C.red, foregroundColor: Colors.white),
+                onPressed: () {
+                  Navigator.pop(c);
+                  deletePeerEntry(t);
+                },
+                icon: const Icon(Icons.delete_outline_rounded),
+                label: const Text('امسحه (لسه ماوصلش)'),
+              )
+            else
+              Text('ده ${phoneWord(viewName)} — التعديل من عليه هو', style: const TextStyle(color: C.blue, fontWeight: FontWeight.w700)),
           ]),
         ),
         ),
@@ -4602,15 +5278,58 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   Future<void> openStartBalances() async {
     if (blockedInView()) return;
     final d = own;
+    if (balanceGuard.enabled && !await askPin(context, title: 'الرقم السري عشان تشوف الأرصدة')) return;
+    if (!mounted) return;
     final ok = await Navigator.push<bool>(context, MaterialPageRoute(builder: (_) => StartBalancesScreen(data: d)));
     if (ok == true) {
       await persist();
-      if (mounted) toast(context, 'اتحفظت الأرصدة • الإجمالي ${egp(d.totalBalance)}');
+      if (mounted) toast(context, 'اتحفظت الأرصدة • الإجمالي ${balanceGuard.text(d.totalBalance)}');
     }
   }
 
   Future<void> openTxn(Txn t) =>
       viewOnly ? showTxnInfo(t) : openForm(t.type, existing: t, bill: t.type == tBill ? d.billById(t.billId) : null);
+
+  /// v6: وانا بتفرج على التليفون التاني ← أسجّل له مصروف من أماكنه. بيتحفظ عندي «لسه ماوصلتش» ويتبعت مع «ابعت نسختي».
+  Future<void> openPeerExpense() async {
+    if (!viewOnly) return;
+    final pid = _viewPid, name = viewName;
+    final v = d;
+    if (v.activePlaces.isEmpty) {
+      toast(context, 'مفيش أماكن في نسخة $name — خليه يبعت نسخة جديدة', bad: true);
+      return;
+    }
+    final r = await Navigator.push<TxnFormResult>(
+      context,
+      MaterialPageRoute(builder: (_) => TxnFormScreen(data: v, type: tExpense, forName: name)),
+    );
+    if (r?.saved == null || !mounted) return;
+    final x = own.addPeerEntry(pid, name, r!.saved!);
+    own.learnItems(x.copy()); // أسماء الأصناف تبقى اختيار عندي كمان
+    await persist();
+    if (!mounted) return;
+    _refreshView();
+    final go = await confirmDialog(
+        context,
+        'اتسجل لـ $name',
+        '${egp(x.amount)} • ${x.category}\n'
+            'هيبان عنده باسمك ولونه مختلف لما توصله نسختك ويدوس «تحديث».\n'
+            'تبعت نسختك دلوقتي؟',
+        yes: 'ابعت نسختي',
+        no: 'بعدين');
+    if (go && mounted) await sendCopy();
+  }
+
+  /// v6: مسح مصروف سجّلته للتليفون التاني (لسه ماوصلوش)
+  Future<void> deletePeerEntry(Txn t) async {
+    final ok = await confirmDialog(context, 'تمسحه؟', '${egp(t.amount)} • ${t.category}\nلسه ماوصلش لـ $viewName — هيتشال ومش هيتبعت.',
+        yes: 'امسح', danger: true);
+    if (!ok) return;
+    own.removePeerEntry(t.id);
+    await persist();
+    _refreshView();
+    if (mounted) toast(context, 'اتمسح');
+  }
 
   Future<void> deleteTxn(Txn t) async {
     if (blockedInView()) return;
@@ -4622,7 +5341,10 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   }
 
   void setMonth(String m) => setState(() => month = m);
-  void goTab(int i) => setState(() => tab = i);
+  void goTab(int i) {
+    balanceGuard.hideAll();
+    setState(() => tab = i);
+  }
 
   void quickAdd() {
     if (blockedInView()) return;
@@ -4694,6 +5416,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
             icon: const Icon(Icons.tune_rounded),
             onPressed: () async {
               exitView(); // الإعدادات دايمًا بتاعة التليفون ده
+              balanceGuard.hideAll();
               await Navigator.push(context, MaterialPageRoute(builder: (_) => SettingsScreen(shell: this)));
               await persist();
             },
@@ -4712,16 +5435,26 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
               Expanded(child: pages[tab]),
             ])
           : pages[tab],
-      floatingActionButton: tab <= 2 && !viewOnly
-          ? FloatingActionButton.extended(
-              onPressed: tab == 2 ? () => openForm(tAdvance) : quickAdd,
-              icon: const Icon(Icons.add_rounded),
-              label: Text(tab == 2 ? 'سلفة' : 'تسجيل', style: const TextStyle(fontWeight: FontWeight.w800)),
-            )
-          : null,
+      floatingActionButton: viewOnly
+          ? (tab <= 1
+              ? FloatingActionButton.extended(
+                  backgroundColor: C.mine,
+                  foregroundColor: Colors.black,
+                  onPressed: openPeerExpense,
+                  icon: const Icon(Icons.add_shopping_cart_rounded),
+                  label: Text('مصروف لـ $viewName', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w800)),
+                )
+              : null)
+          : tab <= 2
+              ? FloatingActionButton.extended(
+                  onPressed: tab == 2 ? () => openForm(tAdvance) : quickAdd,
+                  icon: const Icon(Icons.add_rounded),
+                  label: Text(tab == 2 ? 'سلفة' : 'تسجيل', style: const TextStyle(fontWeight: FontWeight.w800)),
+                )
+              : null,
       bottomNavigationBar: NavigationBar(
         selectedIndex: tab,
-        onDestinationSelected: (i) => setState(() => tab = i),
+        onDestinationSelected: goTab,
         destinations: [
           const NavigationDestination(icon: Icon(Icons.home_outlined), selectedIcon: Icon(Icons.home_rounded), label: 'الرئيسية'),
           const NavigationDestination(icon: Icon(Icons.list_alt_outlined), selectedIcon: Icon(Icons.list_alt_rounded), label: 'العمليات'),
@@ -4802,7 +5535,9 @@ class HomeTab extends StatelessWidget {
           FittedBox(
             fit: BoxFit.scaleDown,
             alignment: AlignmentDirectional.centerStart,
-            child: Text(egp(total),
+            child: MaskedAmount(
+                keyId: '${shell.viewKey}total',
+                text: egp(total),
                 style: TextStyle(fontSize: 34, fontWeight: FontWeight.w900, color: total < 0 ? C.red : C.gold)),
           ),
           const SizedBox(height: 12),
@@ -4927,7 +5662,11 @@ class HomeTab extends StatelessWidget {
           FittedBox(
             fit: BoxFit.scaleDown,
             alignment: AlignmentDirectional.centerStart,
-            child: Text(money(b), style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: b < 0 ? C.red : C.text)),
+            child: MaskedAmount(
+                keyId: '${shell.viewKey}place:${p.id}',
+                text: money(b),
+                showIcon: false,
+                style: TextStyle(fontSize: 22, fontWeight: FontWeight.w900, color: b < 0 ? C.red : C.text)),
           ),
           const Text('جنيه', style: TextStyle(color: C.muted, fontSize: 11)),
         ]),
@@ -4956,6 +5695,12 @@ class PlaceDetailsScreen extends StatefulWidget {
 
 class _PlaceDetailsScreenState extends State<PlaceDetailsScreen> {
   @override
+  void dispose() {
+    balanceGuard.hideAll(); // v6: الرقم اللي اتفتح هنا يتخبى لما تخرج
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     final d = widget.shell.d;
     final p = widget.place;
@@ -4971,8 +5716,11 @@ class _PlaceDetailsScreenState extends State<PlaceDetailsScreen> {
               color: C.card, borderRadius: BorderRadius.circular(22), border: Border.all(color: placeColor(p.kind))),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             const Text('الرصيد', style: TextStyle(color: C.muted)),
-            Text(egp(b), style: TextStyle(fontSize: 30, fontWeight: FontWeight.w900, color: b < 0 ? C.red : C.gold)),
-            Text('رصيد البداية: ${egp(p.opening)}', style: const TextStyle(color: C.muted, fontSize: 12)),
+            MaskedAmount(
+                keyId: '${widget.shell.viewKey}details:${p.id}',
+                text: egp(b),
+                style: TextStyle(fontSize: 30, fontWeight: FontWeight.w900, color: b < 0 ? C.red : C.gold)),
+            Text('رصيد البداية: ${balanceGuard.text(p.opening)}', style: const TextStyle(color: C.muted, fontSize: 12)),
           ]),
         ),
         const SizedBox(height: 12),
@@ -5527,6 +6275,9 @@ class _MonthTabState extends State<MonthTab> {
   MoneyData get d => sh.d;
 
   Future<void> exportExcel() async {
+    // v6: ملف الإكسيل فيه الأرصدة ← محتاج الرقم السري لو الإخفاء شغال
+    if (balanceGuard.enabled && !await askPin(context, title: 'الرقم السري عشان الإكسيل (فيه الأرصدة)')) return;
+    if (!mounted) return;
     setState(() => busy = true);
     try {
       final bytes = buildMonthExcel(d, sh.month);
@@ -5967,7 +6718,55 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (mounted) setState(() {});
   }
 
+  // ---------- v6: إخفاء الأرصدة برقم سري ----------
+  Future<void> togglePin(bool on) async {
+    if (on) {
+      final pin = await askNewPin(context);
+      if (pin == null || !mounted) return;
+      d.setPin(pin);
+      balanceGuard.hideAll();
+      await save();
+      if (mounted) toast(context, 'الأرصدة بقت مخفية — دوس على أي رقم واكتب الرقم السري عشان يبان');
+    } else {
+      if (!await askPin(context, title: 'الرقم السري الحالي')) return;
+      d.clearPin();
+      balanceGuard.hideAll();
+      await save();
+      if (mounted) toast(context, 'الأرصدة بقت ظاهرة على طول');
+    }
+  }
+
+  Future<void> changePin() async {
+    if (!await askPin(context, title: 'الرقم السري الحالي')) return;
+    if (!mounted) return;
+    final pin = await askNewPin(context);
+    if (pin == null || !mounted) return;
+    d.setPin(pin);
+    balanceGuard.hideAll();
+    await save();
+    if (mounted) toast(context, 'اتغيّر الرقم السري');
+  }
+
+  Future<void> forgotPin() async {
+    final ok = await confirmDialog(
+        context,
+        'نسيت الرقم السري؟',
+        'مفيش طريقة نرجّع بيها الرقم (مش متسجّل في أي حتة، متخزّن متشفّر بس).\n'
+            'اللي ممكن نعمله: نلغي إخفاء الأرصدة، وبعدها تعمل رقم جديد لو حابب.\n\n'
+            'خلي بالك: الإخفاء ده للأرصدة بس — العمليات والمبالغ في السجل ظاهرة عادي لأي حد ماسك الموبايل.',
+        yes: 'الغي الإخفاء',
+        danger: true);
+    if (!ok) return;
+    d.clearPin();
+    balanceGuard.hideAll();
+    await save();
+    if (mounted) toast(context, 'اتلغى الإخفاء — تقدر تعمل رقم جديد من هنا');
+  }
+
   Future<void> editPlace({Place? p}) async {
+    // v6: رصيد البداية رقم رصيد ← محتاج الرقم السري لو الإخفاء شغال
+    if (p != null && p.opening != 0 && balanceGuard.enabled && !await askPin(context, title: 'الرقم السري عشان تعدّل الرصيد')) return;
+    if (!mounted) return;
     final name = TextEditingController(text: p?.name ?? '');
     final open = TextEditingController(text: p == null || p.opening == 0 ? '' : money(p.opening).replaceAll(',', ''));
     var kind = p?.kind ?? kPlaceOther;
@@ -6031,7 +6830,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final used = d.txns.any((t) => t.placeId == p.id || t.toPlaceId == p.id);
     if (used) {
       final ok = await confirmDialog(context, 'المكان ده عليه عمليات',
-          'مش هيتمسح عشان الحساب مايتلخبطش — هيتخبى من الاختيارات (رصيده الحالي ${egp(d.balanceOf(p.id))} هيفضل في الإجمالي). تخبيه؟',
+          'مش هيتمسح عشان الحساب مايتلخبطش — هيتخبى من الاختيارات (رصيده الحالي ${balanceGuard.text(d.balanceOf(p.id))} هيفضل في الإجمالي). تخبيه؟',
           yes: 'خبيه');
       if (!ok) return;
       p.archived = true;
@@ -6138,6 +6937,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> restore() async {
+    // v6: النسخة القديمة ممكن تكون من غير رقم سري ← محتاج الرقم الحالي
+    if (balanceGuard.enabled && !await askPin(context, title: 'الرقم السري عشان ترجّع نسخة')) return;
     await getAppFolder(requestPermissions: true);
     final list = await listBackups();
     if (!mounted) return;
@@ -6187,7 +6988,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ListTile(
             leading: Icon(placeIcon(p.kind), color: p.archived ? C.muted : placeColor(p.kind)),
             title: Text(p.name + (p.archived ? ' (مخفي)' : ''), style: const TextStyle(fontWeight: FontWeight.w700)),
-            subtitle: Text('الرصيد ${egp(d.balanceOf(p.id))} • البداية ${egp(p.opening)}', style: const TextStyle(color: C.muted, fontSize: 12)),
+            subtitle: Text('الرصيد ${balanceGuard.text(d.balanceOf(p.id))} • البداية ${balanceGuard.text(p.opening)}', style: const TextStyle(color: C.muted, fontSize: 12)),
             onTap: () => editPlace(p: p),
             trailing: p.archived
                 ? TextButton(
@@ -6200,6 +7001,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         OutlinedButton.icon(
           onPressed: () async {
+            if (balanceGuard.enabled && !await askPin(context, title: 'الرقم السري عشان تشوف الأرصدة')) return;
+            if (!context.mounted) return;
             final ok = await Navigator.push<bool>(context, MaterialPageRoute(builder: (_) => StartBalancesScreen(data: d)));
             if (ok == true) await save();
           },
@@ -6342,6 +7145,27 @@ class _SettingsScreenState extends State<SettingsScreen> {
             if (mounted) setState(() {});
           },
         ),
+        const SectionTitle('إخفاء الأرصدة'),
+        SwitchListTile(
+          secondary: const Icon(Icons.lock_rounded, color: C.gold),
+          title: const Text('إخفاء الأرصدة برقم سري'),
+          subtitle: const Text('الأرصدة تبان «••••••» — دوس على رقم واكتب الرقم السري يبان هو بس (30 ثانية)',
+              style: TextStyle(color: C.muted, fontSize: 12)),
+          value: d.hasPin,
+          onChanged: togglePin,
+        ),
+        if (d.hasPin) ...[
+          ListTile(
+            leading: const Icon(Icons.password_rounded, color: C.emerald),
+            title: const Text('غيّر الرقم السري'),
+            onTap: changePin,
+          ),
+          ListTile(
+            leading: const Icon(Icons.help_outline_rounded, color: C.muted),
+            title: const Text('نسيت الرقم السري؟'),
+            onTap: forgotPin,
+          ),
+        ],
         const SectionTitle('النسخ الاحتياطي'),
         const Text('نسخة تلقائية كل يوم في «A2R Money/Backups» (آخر ١٤ يوم).', style: TextStyle(color: C.muted, fontSize: 12)),
         const SizedBox(height: 8),
